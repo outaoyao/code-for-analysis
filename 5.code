@@ -1,0 +1,71 @@
+################################################################################
+# Script Name: 5. Covariate Processing - Body Mass Index (BMI)
+# Purpose: Clean BMXBMI, ensure numeric precision, and generate NIH categories.
+# Data Cycles: 2017-2020 (P_BMX) and 2021-2023 (BMX_L)
+# Output: Standardized BMI Dataset (5.data.rds)
+################################################################################
+
+# 1. Environment & Libraries ---------------------------------------------------
+library(nhanesA)
+library(tidyverse)
+
+export_dir <- "D:/code"
+if (!dir.exists(export_dir)) dir.create(export_dir, recursive = TRUE)
+
+# 2. Data Retrieval & Harmonization --------------------------------------------
+cat("Harmonizing BMI data across cycles...\n")
+
+
+process_bmi <- function(table_name, cycle_label) {
+  nhanes(table_name) %>%
+    select(SEQN, BMXBMI) %>%
+    mutate(
+      
+      BMI_value = as.numeric(BMXBMI),
+      CYCLE = cycle_label
+    )
+}
+
+bmi_1720 <- process_bmi("P_BMX", "2017-2020")
+bmi_2123 <- process_bmi("BMX_L", "2021-2023")
+
+bmi_combined <- bind_rows(bmi_1720, bmi_2123)
+
+# 3. Clinical Categorization (NIH/WHO Standard) -------------------------------
+# Logic: [Low, High) - Includes left boundary, excludes right
+# 
+bmi_processed <- bmi_combined %>%
+  mutate(
+    
+    BMI_cat = cut(BMI_value,
+                  breaks = c(-Inf, 18.5, 25, 30, Inf),
+                  labels = c("Underweight", "Normal", "Overweight", "Obese"),
+                  right = FALSE),
+    
+    
+    # 1=Underweight, 2=Normal, 3=Overweight, 4=Obese
+    BMI_cat_ordinal = as.integer(BMI_cat),
+    
+    
+    BMI_detailed = cut(BMI_value,
+                       breaks = c(-Inf, 18.5, 25, 30, 35, 40, Inf),
+                       labels = c("Underweight", "Normal", "Overweight", 
+                                  "Obesity Class I", "Obesity Class II", "Obesity Class III"),
+                       right = FALSE),
+    
+    
+    BMI_detailed_ordinal = as.integer(BMI_detailed)
+  ) %>%
+  
+  select(SEQN, BMI_value, BMI_cat, BMI_cat_ordinal, BMI_detailed, BMI_detailed_ordinal, CYCLE)
+
+# 4. Quality Control & Export --------------------------------------------------
+cat("\n--- BMI Value Statistics ---\n")
+print(summary(bmi_processed$BMI_value))
+
+cat("\n--- BMI Category Distribution ---\n")
+print(table(bmi_processed$BMI_cat, useNA = "always"))
+
+save_path <- file.path(export_dir, "5.data.rds")
+saveRDS(bmi_processed, save_path)
+cat("\nBMI data successfully exported to:", save_path, "\n")
