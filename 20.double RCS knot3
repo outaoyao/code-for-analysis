@@ -1,0 +1,337 @@
+################################################################################
+# STUDY: Multidimensional Circadian Misalignment and Depression
+# ANALYSIS: Independent Nonlinear Associations
+# MODEL: Survey-weighted logistic regression with restricted cubic splines
+################################################################################
+
+# ==============================================================================
+# 0. Clear environment
+# ==============================================================================
+
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+
+# ==============================================================================
+# 1. Load required packages
+# ==============================================================================
+
+library(survey)
+library(rms)
+library(dplyr)
+library(ggplot2)
+library(car)
+
+# Load custom function for survey-weighted RCS visualization
+source("D:/code/svyggrcs1.8R.R")
+
+# ==============================================================================
+# 2. Import dataset
+# ==============================================================================
+
+nhanes_data <- readRDS("D:/code/18.Dataset.rds")
+
+# ==============================================================================
+# 3. Variable preparation (factor conversion)
+# ==============================================================================
+
+nhanes_data <- nhanes_data %>%
+  mutate(
+    RIAGENDR = factor(RIAGENDR),
+    RIDRETH1 = factor(RIDRETH1),
+    DMDEDUC2 = factor(DMDEDUC2),
+    smoke_status = factor(smoke_status),
+    DMDMARTZ = factor(DMDMARTZ),
+    AlcoholCategory = factor(AlcoholCategory),
+    diabetes_status = factor(diabetes_status),
+    hypertension_status = factor(hypertension_status),
+    work_status = factor(work_status)
+  )
+
+# ==============================================================================
+# 4. Construct NHANES survey design object
+# ==============================================================================
+
+options(survey.lonely.psu = "adjust")
+
+nhanes_design <- svydesign(
+  id = ~SDMVPSU,
+  strata = ~SDMVSTRA,
+  weights = ~mec_adj,
+  data = nhanes_data,
+  nest = TRUE
+)
+
+# ==============================================================================
+# 5. Define datadist object (required for spline reference values)
+# ==============================================================================
+
+dd <- datadist(nhanes_data)
+options(datadist = "dd")
+
+# ==============================================================================
+# 6. Primary model: dual restricted cubic splines
+# ==============================================================================
+
+fit_joint <- svyglm(
+  Moderate_depression_above ~ 
+    rcs(CMB_Score, 3) +
+    rcs(dur_wd, 3) +
+    RIDAGEYR +
+    RIAGENDR +
+    RIDRETH1 +
+    DMDEDUC2 +
+    smoke_status +
+    DMDMARTZ +
+    BMI_value +
+    AlcoholCategory +
+    diabetes_status +
+    hypertension_status +
+    work_status +
+    MET_total +
+    INDFMPIR +
+    sedentary_min,
+  design = nhanes_design,
+  family = quasibinomial()
+)
+
+summary(fit_joint)
+
+#7. Overall association tests (Wald tests)
+cat("\n--- Overall Association Test ---\n")
+
+regTermTest(fit_joint, ~ rcs(CMB_Score, 3))
+regTermTest(fit_joint, ~ rcs(dur_wd, 3))
+
+#8. Assessment of nonlinearity using nested model comparison
+fit_cmb_linear <- svyglm(
+  Moderate_depression_above ~ 
+    CMB_Score +
+    rcs(dur_wd, 3) +
+    RIDAGEYR +
+    RIAGENDR +
+    RIDRETH1 +
+    DMDEDUC2 +
+    smoke_status +
+    DMDMARTZ +
+    BMI_value +
+    AlcoholCategory +
+    diabetes_status +
+    hypertension_status +
+    work_status +
+    MET_total +
+    INDFMPIR +
+    sedentary_min,
+  design = nhanes_design,
+  family = quasibinomial()
+)
+
+anova(fit_cmb_linear, fit_joint)
+
+fit_sleep_linear <- svyglm(
+  Moderate_depression_above ~ 
+    rcs(CMB_Score, 3) +
+    dur_wd +
+    RIDAGEYR +
+    RIAGENDR +
+    RIDRETH1 +
+    DMDEDUC2 +
+    smoke_status +
+    DMDMARTZ +
+    BMI_value +
+    AlcoholCategory +
+    diabetes_status +
+    hypertension_status +
+    work_status +
+    MET_total +
+    INDFMPIR +
+    sedentary_min,
+  design = nhanes_design,
+  family = quasibinomial()
+)
+
+anova(fit_sleep_linear, fit_joint)
+
+################################################################################
+# FINAL PUBLICATION VERSION
+# Dual RCS Plot with Median Reference (Survey Weighted)
+################################################################################
+
+library(ggplot2)
+library(patchwork)
+
+# ==============================================================================
+# 1️⃣ Generate prediction dataset for CMB
+# ==============================================================================
+
+cmb_seq <- seq(
+  min(nhanes_data$CMB_Score, na.rm = TRUE),
+  max(nhanes_data$CMB_Score, na.rm = TRUE),
+  length.out = 100
+)
+
+newdata_cmb <- data.frame(
+  CMB_Score = cmb_seq,
+  dur_wd = median(nhanes_data$dur_wd, na.rm = TRUE),
+  RIDAGEYR = median(nhanes_data$RIDAGEYR, na.rm = TRUE),
+  BMI_value = median(nhanes_data$BMI_value, na.rm = TRUE),
+  MET_total = median(nhanes_data$MET_total, na.rm = TRUE),
+  INDFMPIR = median(nhanes_data$INDFMPIR, na.rm = TRUE),
+  sedentary_min = median(nhanes_data$sedentary_min, na.rm = TRUE)
+)
+
+factor_vars <- c("RIAGENDR","RIDRETH1","DMDEDUC2","smoke_status",
+                 "DMDMARTZ","AlcoholCategory",
+                 "diabetes_status","hypertension_status","work_status")
+
+for(v in factor_vars){
+  newdata_cmb[[v]] <- factor(
+    levels(nhanes_data[[v]])[1],
+    levels = levels(nhanes_data[[v]])
+  )
+}
+
+# ==============================================================================
+# 2️⃣ Compute model-based predictions
+# ==============================================================================
+
+Xmat_cmb <- model.matrix(
+  delete.response(terms(fit_joint)),
+  data = newdata_cmb
+)
+
+beta_joint <- coef(fit_joint)
+Vcov_joint <- vcov(fit_joint)
+
+fit_cmb <- as.vector(Xmat_cmb %*% beta_joint)
+
+se_cmb <- sqrt(diag(
+  Xmat_cmb %*% Vcov_joint %*% t(Xmat_cmb)
+))
+
+# ==============================================================================
+# 3️⃣ Set median as reference value
+# ==============================================================================
+
+ref_cmb <- median(nhanes_data$CMB_Score, na.rm = TRUE)
+ref_index_cmb <- which.min(abs(newdata_cmb$CMB_Score - ref_cmb))
+ref_logit_cmb <- fit_cmb[ref_index_cmb]
+
+newdata_cmb$OR <- exp(fit_cmb - ref_logit_cmb)
+newdata_cmb$LL <- exp(fit_cmb - 1.96 * se_cmb - ref_logit_cmb)
+newdata_cmb$UL <- exp(fit_cmb + 1.96 * se_cmb - ref_logit_cmb)
+
+# ==============================================================================
+# 4️⃣Figure 1A – CMB
+# ==============================================================================
+
+p1 <- ggplot(newdata_cmb, aes(x = CMB_Score, y = OR)) +
+  geom_ribbon(aes(ymin = LL, ymax = UL),
+              fill = "#56B4E9", alpha = 0.35) +
+  geom_line(color = "#0072B2", size = 1.2) +
+  geom_hline(yintercept = 1,
+             linetype = "dashed",
+             color = "grey40") +
+  coord_cartesian(
+    xlim = quantile(nhanes_data$CMB_Score, c(0.05, 0.95)),
+    ylim = c(0.5, 1.5)
+  ) +
+  theme_classic(base_size = 14) +
+  labs(
+    x = "Circadian Misalignment Score",
+    y = "Adjusted Odds Ratio (95% CI)",
+    title = "A. Circadian Misalignment and Depression"
+  )
+
+# ==============================================================================
+# 5️⃣Generate prediction dataset for Weekday Weekday Sleep Duration
+# ==============================================================================
+
+sleep_seq <- seq(
+  min(nhanes_data$dur_wd, na.rm = TRUE),
+  max(nhanes_data$dur_wd, na.rm = TRUE),
+  length.out = 100
+)
+
+newdata_sleep <- data.frame(
+  dur_wd = sleep_seq,
+  CMB_Score = median(nhanes_data$CMB_Score, na.rm = TRUE),
+  RIDAGEYR = median(nhanes_data$RIDAGEYR, na.rm = TRUE),
+  BMI_value = median(nhanes_data$BMI_value, na.rm = TRUE),
+  MET_total = median(nhanes_data$MET_total, na.rm = TRUE),
+  INDFMPIR = median(nhanes_data$INDFMPIR, na.rm = TRUE),
+  sedentary_min = median(nhanes_data$sedentary_min, na.rm = TRUE)
+)
+
+for(v in factor_vars){
+  newdata_sleep[[v]] <- factor(
+    levels(nhanes_data[[v]])[1],
+    levels = levels(nhanes_data[[v]])
+  )
+}
+
+# ==============================================================================
+# 6️⃣Model-based prediction for weekday sleep duration
+# ==============================================================================
+
+Xmat_sleep <- model.matrix(
+  delete.response(terms(fit_joint)),
+  data = newdata_sleep
+)
+
+fit_sleep <- as.vector(Xmat_sleep %*% beta_joint)
+
+se_sleep <- sqrt(diag(
+  Xmat_sleep %*% Vcov_joint %*% t(Xmat_sleep)
+))
+
+# reference
+ref_sleep <- median(nhanes_data$dur_wd, na.rm = TRUE)
+ref_index_sleep <- which.min(abs(newdata_sleep$dur_wd - ref_sleep))
+ref_logit_sleep <- fit_sleep[ref_index_sleep]
+
+newdata_sleep$OR <- exp(fit_sleep - ref_logit_sleep)
+newdata_sleep$LL <- exp(fit_sleep - 1.96 * se_sleep - ref_logit_sleep)
+newdata_sleep$UL <- exp(fit_sleep + 1.96 * se_sleep - ref_logit_sleep)
+
+# ==============================================================================
+# 7️⃣Figure 1B – Weekday Sleep Duration
+# ==============================================================================
+
+p2 <- ggplot(newdata_sleep, aes(x = dur_wd, y = OR)) +
+  geom_ribbon(aes(ymin = LL, ymax = UL),
+              fill = "#F0E442", alpha = 0.35) +
+  geom_line(color = "#D55E00", size = 1.2) +
+  geom_hline(yintercept = 1,
+             linetype = "dashed",
+             color = "grey40") +
+  coord_cartesian(
+    xlim = quantile(nhanes_data$dur_wd, c(0.05, 0.95)),
+    ylim = c(0.5, 1.5)
+  ) +
+  theme_classic(base_size = 14) +
+  labs(
+    x = "Weekday Sleep Duration (hours)",
+    y = "Adjusted Odds Ratio (95% CI)",
+    title = "B. Weekday Sleep Duration and Depression"
+  )
+
+# ==============================================================================
+# 8️⃣ Combine figures
+# ==============================================================================
+
+p1 + p2
+
+# ==============================================================================
+# 9 Identification of nadir points (minimum odds ratio)
+# ==============================================================================
+cmb_turning_point <- newdata_cmb$CMB_Score[
+  which.min(newdata_cmb$OR)
+]
+
+cmb_turning_point
+
+sleep_turning_point <- newdata_sleep$dur_wd[
+  which.min(newdata_sleep$OR)
+]
+
+sleep_turning_point
