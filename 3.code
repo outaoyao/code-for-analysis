@@ -1,0 +1,117 @@
+################################################################################
+# Script Name: 3. Sleep Metrics Engineering (NHANES 2017-2023)
+# Purpose: Calculate Sleep Midpoints, SJL, and WCS while retaining all variables.
+# Methodology: Circular numeric logic for time-cross-midnight adjustments.
+# Output: Comprehensive Sleep Dataset (3.data.rds)
+################################################################################
+
+# 1. Environment & Libraries ---------------------------------------------------
+library(nhanesA)
+library(tidyverse)
+library(stringr)
+
+export_dir <- "D:/code"
+if (!dir.exists(export_dir)) dir.create(export_dir, recursive = TRUE)
+
+# 2. Helper Functions ----------------------------------------------------------
+
+# Convert HH:MM string to minutes from midnight (Numeric precision)
+time_to_min <- function(time_str) {
+  parts <- str_split_fixed(as.character(time_str), ":", 2)
+  h <- as.numeric(parts[, 1])
+  m <- as.numeric(parts[, 2])
+  total <- h * 60 + m
+  # Reset 1440 (24:00) to 0 (00:00) to normalize the 24-hour cycle
+  total <- if_else(total == 1440, 0, total)
+  # Validation: Must fall within 0-1439 minutes
+  if_else(!is.na(total) & total >= 0 & total < 1440, total, NA_real_)
+}
+  
+
+# Calculate Sleep Midpoint (Circular logic for overnight sleep)
+calc_midpoint <- function(sleep_time_str, wake_time_str) {
+  s <- time_to_min(sleep_time_str)
+  w <- time_to_min(wake_time_str)
+  
+  # Logic: If wake time < sleep time, the participant woke up the next day
+  # 
+  mid <- if_else(w >= s, s + (w - s)/2, s + (1440 + w - s)/2)
+  
+  # Normalize to 24-hour cycle
+  if_else(mid >= 1440, mid - 1440, mid)
+}
+
+# 3. Data Processing -----------------------------------------------------------
+
+cat("Downloading and Numeric Processing Sleep Data...\n")
+s_1720 <- nhanes('P_SLQ')
+s_2123 <- nhanes('SLQ_L')
+
+# Combine and process
+sleep_processed <- bind_rows(s_1720, s_2123) %>%
+  mutate(
+    # 3.1 Data Cleaning: Handle NHANES special codes
+    across(everything(), ~{
+      val <- as.character(.)
+      if_else(val %in% c("77777", "99999", "Refused", "Don't know", "."), NA_character_, val)
+    }),
+    
+    # 3.2 Numeric Duration Extraction (Hours)
+    dur_wd = as.numeric(SLD012), 
+    dur_we = as.numeric(SLD013)
+  ) %>%
+  # Quality Control: Filter for clinically plausible sleep durations (3-14 hours)
+  filter(between(dur_wd, 3, 14), between(dur_we, 3, 14)) %>% 
+  mutate(
+    # 3.3 Conversion to Minutes (HH:MM -> Minutes)
+    across(c(SLQ300, SLQ310, SLQ320, SLQ330), time_to_min, .names = "{.col}_min"),
+    
+    # 3.4 Engineering Midpoints
+    midpoint_wd = calc_midpoint(SLQ300, SLQ310),
+    midpoint_we = calc_midpoint(SLQ320, SLQ330),
+    
+    # 3.5 Social Jetlag (SJL) Engineering
+    # 
+    SJL_raw = midpoint_we - midpoint_wd,
+    # Circular correction: Ensure SJL represents the shortest arc on a 24h clock
+    SJL_raw = case_when(
+      SJL_raw > 720  ~ SJL_raw - 1440,
+      SJL_raw < -720 ~ SJL_raw + 1440,
+      TRUE ~ SJL_raw
+    ),
+    SJL_abs = abs(SJL_raw),
+    
+    # 3.6 Weekend Catch-up Sleep (WCS) Engineering
+    WCS_raw = dur_we - dur_wd,
+    WCS_abs = abs(dur_we - dur_wd),
+    
+    # 3.7 Categorized sleep duration
+    dur_wd_cat = case_when(
+      dur_wd < 7 ~ "<7 hours",
+      dur_wd >= 7 & dur_wd < 9 ~ "7-9 hours",
+      dur_wd >= 9 ~ "≥9 hours",
+      TRUE ~ NA_character_
+    ),
+    dur_we_cat = case_when(
+      dur_we < 7 ~ "<7 hours",
+      dur_we >= 7 & dur_we < 9 ~ "7-9 hours",
+      dur_we >= 9 ~ "≥9 hours",
+      TRUE ~ NA_character_
+    ),
+    
+    
+    dur_wd_cat = factor(dur_wd_cat, levels = c("7-9 hours", "<7 hours", "≥9 hours")),
+    dur_we_cat = factor(dur_we_cat, levels = c("7-9 hours", "<7 hours", "≥9 hours")),
+    
+    
+    dur_wd_cat_num = as.numeric(dur_wd_cat),
+    dur_we_cat_num = as.numeric(dur_we_cat)
+    ) 
+# Note: The final 'select' is removed to retain ALL original and engineered variables.
+
+# 4. Export --------------------------------------------------------------------
+save_path <- file.path(export_dir, "3.data.rds")
+saveRDS(sleep_processed, save_path)
+
+cat("\nProcessing complete. Dataset saved to:", save_path, "\n")
+cat("Final Dataset dimensions:", dim(sleep_processed)[1], "rows and", dim(sleep_processed)[2], "variables.\n")
