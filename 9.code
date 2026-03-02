@@ -1,0 +1,53 @@
+################################################################################
+# Script Name: 9. Covariate Processing - Work Status (NHANES 2017-2023)
+# Purpose: Harmonize employment status using numeric code matching.
+# Definitions: 0: Employed (Code 1,2), 1: Unemployed/Not working (Code 3,4)
+# Output: Cleaned Work Status Dataset (9.data.rds)
+################################################################################
+
+# 1. Environment & Libraries ---------------------------------------------------
+library(nhanesA)
+library(tidyverse)
+
+export_dir <- "D:/code"
+if (!dir.exists(export_dir)) dir.create(export_dir, recursive = TRUE)
+
+# 2. Data Retrieval & Processing Function --------------------------------------
+fetch_work_status <- function(table_name, cycle_label) {
+  cat("Processing Cycle:", cycle_label, "...\n")
+  
+  # Note: nhanesA might return factors. We use as.numeric() to get original codes.
+  raw_data <- nhanes(table_name)
+  
+  processed <- raw_data %>%
+    select(SEQN, OCD150) %>%
+    mutate(
+      # Standardizing Work Status using official NHANES numeric codes
+      # Convert factor/character to numeric for precise matching
+      ocd_num = as.numeric(OCD150),
+      
+      work_status = case_when(
+        ocd_num %in% c(1, 2) ~ 0, # Working or with job
+        ocd_num %in% c(3, 4) ~ 1, # Looking for work or not working
+        TRUE ~ NA_real_          # Codes 7, 9 or missing
+      ),
+      CYCLE = cycle_label
+    ) %>%
+    select(SEQN, work_status, CYCLE)
+  
+  return(processed)
+}
+
+# 3. Execution & Merging -------------------------------------------------------
+ocq_1720 <- fetch_work_status("P_OCQ", "2017-2020")
+ocq_2123 <- fetch_work_status("OCQ_L", "2021-2023")
+
+work_combined <- bind_rows(ocq_1720, ocq_2123)
+
+# 4. Quality Control & Export --------------------------------------------------
+cat("\n--- Final Work Status Distribution (Numeric-based) ---\n")
+print(table(work_combined$work_status, work_combined$CYCLE, useNA = "always"))
+
+save_path <- file.path(export_dir, "9.data.rds")
+saveRDS(work_combined, save_path)
+cat("\nWork status data successfully exported to:", save_path, "\n")
