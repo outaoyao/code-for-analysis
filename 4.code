@@ -1,0 +1,85 @@
+################################################################################
+# Script Name: 4. Advanced Smoking Status Engineering (NHANES 2017-2023)
+# Purpose: Multi-variable logic to define Never/Former/Current Smokers
+# Variables: SMQ020, SMQ040, SMQ621, SMD641, SMD650
+################################################################################
+
+library(nhanesA)
+library(tidyverse)
+
+export_dir <- "D:/code"
+if (!dir.exists(export_dir)) dir.create(export_dir, recursive = TRUE)
+
+# 1. Processing Function with Hierarchical Logic -------------------------------
+process_smoking_v2 <- function(table_name, cycle_label) {
+  cat("Processing cycle:", cycle_label, "...\n")
+  
+  
+  raw_data <- nhanes(table_name)
+  
+  
+  df <- raw_data %>%
+    as_tibble() %>%
+    select(SEQN, 
+           any_of(c("SMQ020", "SMQ040", "SMQ621", "SMD641", "SMD650")))
+  
+  processed <- df %>%
+    mutate(
+      
+      SMQ020 = if_else(SMQ020 %in% c(7, 9), NA_real_, as.numeric(SMQ020)),
+      SMQ040 = if_else(SMQ040 %in% c(7, 9), NA_real_, as.numeric(SMQ040)),
+      SMQ621 = if_else(SMQ621 %in% c(77, 99), NA_real_, as.numeric(SMQ621)),
+      SMD641 = if_else(SMD641 %in% c(77, 99), NA_real_, as.numeric(SMD641)),
+      SMD650 = if_else(SMD650 %in% c(777, 999), NA_real_, as.numeric(SMD650)),
+      
+      
+      monthly_cigs = if_else(!is.na(SMD641) & !is.na(SMD650), SMD641 * SMD650, 0),
+      
+      
+      is_100_plus = case_when(
+        SMQ020 == 1 ~ TRUE,                     
+        SMQ621 == 8 ~ TRUE,                     
+        monthly_cigs >= 100 ~ TRUE,             
+        SMQ020 == 2 ~ FALSE,                    
+        SMQ621 %in% 1:7 ~ FALSE,                
+        TRUE ~ NA                               
+      ),
+      
+      
+      smoke_status = case_when(
+        
+        is_100_plus == FALSE ~ 0,
+        
+        
+        is_100_plus == TRUE & (monthly_cigs >= 100 | SMQ040 %in% c(1, 2)) ~ 2, # Current Smoker
+        
+        
+        is_100_plus == TRUE & (SMQ040 == 3 | monthly_cigs < 100) ~ 1,          # Former Smoker
+        
+        TRUE ~ NA_real_
+      ),
+      
+      CYCLE = cycle_label
+    ) %>%
+    
+    mutate(smoke_label = factor(smoke_status, 
+                                levels = c(0, 1, 2), 
+                                labels = c("Never (<100)", "Former (>=100)", "Current (>=100)")))
+  
+  return(processed)
+}
+
+# 2. Execution -----------------------------------------------------------------
+# 2017-2020 
+smoke_1720 <- process_smoking_v2("P_SMQ", "2017-2020")
+# 2021-2023 
+smoke_2123 <- process_smoking_v2("SMQ_L", "2021-2023")
+
+smoke_final <- bind_rows(smoke_1720, smoke_2123)
+
+# 3. Quality Control -----------------------------------------------------------
+cat("\n--- Final Integrated Smoking Status Distribution ---\n")
+print(table(smoke_final$smoke_label, smoke_final$CYCLE, useNA = "always"))
+
+# 4. Export --------------------------------------------------------------------
+saveRDS(smoke_final, file.path(export_dir, "4.data.rds"))
