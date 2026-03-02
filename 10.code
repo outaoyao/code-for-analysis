@@ -1,0 +1,197 @@
+################################################################################
+# Script Name: 10. Physical Activity & Sedentary Behavior (NHANES 2017-2023)
+# Purpose: Harmonize recreational MET-min/week and daily sedentary duration.
+# Standards: IPAQ Cleaning Protocol (MET Capping at 30k, Sedentary Capping at 16h)
+# Output: Standardized PAQ Dataset (10.data.rds)
+################################################################################
+
+# Load required libraries
+library(nhanesA)
+library(dplyr)
+library(haven)
+library(labelled)
+
+# -------------------------------------------------------------------------
+# 1. Data Acquisition
+# -------------------------------------------------------------------------
+# NHANES 2017-2020 Pre-pandemic cycle
+p_paq <- nhanes('P_PAQ')
+# NHANES 2021-2023 Cycle (corresponding to PAQ_L)
+paq_l <- nhanes('PAQ_L')
+
+# -------------------------------------------------------------------------
+# 2. Data Processing: 2017-2020 Cycle (P_PAQ)
+# -------------------------------------------------------------------------
+df_1720 <- p_paq %>%
+  # Exclude missing or invalid response codes (Refused/Don't know)
+  mutate(across(c(PAD680, PAD675, PAD660), ~ ifelse(. %in% c(7777, 9999, "7777", "9999", "Refused", "Don't know"), NA, .)),
+         across(c(PAQ650, PAQ665), ~ ifelse(. %in% c(7, 9, "7", "9", "Refused", "Don't know"), NA, .)),
+         across(c(PAQ670, PAQ655), ~ ifelse(. %in% c(77, 99, "77", "99", "Refused", "Don't know"), NA, .))) %>%
+  # Ensure variables are treated as numeric for calculation
+  mutate(across(c(PAQ650, PAQ655, PAD660, PAQ665, PAQ670, PAD675), as.numeric)) %>%
+  # Calculate MET-minutes per week
+  mutate(
+    # Vigorous intensity recreational activities (MET score = 8)
+    MET_high = case_when(
+      PAQ650 == 2 ~ 0,
+      PAQ650 == 1 & !is.na(PAQ655) & !is.na(PAD660) ~ PAQ655 * PAD660 * 8 ,
+      TRUE ~ NA_real_
+    ),
+    # Moderate intensity recreational activities (MET score = 4)
+    MET_mod = case_when(
+      PAQ665 == 2 ~ 0,
+      PAQ665 == 1 & !is.na(PAQ670) & !is.na(PAD675) ~ PAQ670 * PAD675 * 4 ,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  # Sum total weekly MET-minutes
+  rowwise() %>%
+  mutate(
+    MET_total = case_when(
+      !is.na(MET_high) & !is.na(MET_mod) ~ MET_high + MET_mod,
+      !is.na(MET_high) & is.na(MET_mod)  ~ MET_high,
+      is.na(MET_high)  & !is.na(MET_mod) ~ MET_mod,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  ungroup() %>%
+  select(SEQN, MET_total, PAD680)
+
+# -------------------------------------------------------------------------
+# 3. Data Processing: 2021-2023 Cycle (PAQ_L)
+# -------------------------------------------------------------------------
+df_2123 <- paq_l %>%
+  # Harmonize invalid codes and missing values
+  mutate(across(c(PAD820, PAD800, PAD680), ~ ifelse(. %in% c(7777, 9999, "7777", "9999", "Refused", "Don't know"), NA, .)),
+         across(c(PAD810Q, PAD790Q), ~ ifelse(. %in% c(7777, 9999, "7777", "9999", "Refused", "Don't know"), NA, .))) %>%
+  # Extract factor labels for time unit conversion
+  mutate(
+    unit_mod_f = to_factor(PAD790U),
+    unit_high_f = to_factor(PAD810U)
+  ) %>%
+  mutate(
+    # Convert frequency to weekly equivalents based on reported unit
+    u_mod = case_when(
+      unit_mod_f %in% c("Day", "D") ~ 7,
+      unit_mod_f %in% c("Week", "W") ~ 1,
+      unit_mod_f %in% c("Month", "M") ~ 1 / 4.345,
+      unit_mod_f %in% c("Year", "Y") ~ 1 / 52.18,
+      TRUE ~ NA_real_
+    ),
+    u_high = case_when(
+      unit_high_f %in% c("Day", "D") ~ 7,
+      unit_high_f %in% c("Week", "W") ~ 1,
+      unit_high_f %in% c("Month", "M") ~ 1 / 4.345,
+      unit_high_f %in% c("Year", "Y") ~ 1 / 52.18,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  # Calculate intensity-specific MET scores
+  mutate(
+    MET_mod = case_when(
+      !is.na(PAD790Q) & !is.na(u_mod) & !is.na(PAD800) ~ as.numeric(PAD790Q) * u_mod * as.numeric(PAD800) * 4,
+      TRUE ~ NA_real_
+    ),
+    MET_high = case_when(
+      !is.na(PAD810Q) & !is.na(u_high) & !is.na(PAD820) ~ as.numeric(PAD810Q) * u_high * as.numeric(PAD820) * 8,
+      TRUE ~ NA_real_
+    )
+    ) %>%
+  # Sum total weekly MET-minutes
+  rowwise() %>%
+  mutate(
+    MET_total = case_when(
+      !is.na(MET_high) & !is.na(MET_mod) ~ MET_high + MET_mod,
+      !is.na(MET_high) & is.na(MET_mod)  ~ MET_high,
+      is.na(MET_high)  & !is.na(MET_mod) ~ MET_mod,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  ungroup() %>%
+  # Ensure consistent variable selection for merging
+  select(SEQN, MET_total, PAD680)
+
+# -------------------------------------------------------------------------
+# 4. Data Merging and Stratification
+# -------------------------------------------------------------------------
+final_data <- bind_rows(df_1720, df_2123) %>%
+  mutate(
+    # Categorize MET scores based on standard thresholds
+    MET_cat_label = case_when(
+      MET_total < 600 ~ "Low",
+      MET_total >= 600 & MET_total <= 3000 ~ "Moderate",
+      MET_total > 3000 ~ "High",
+      TRUE ~ NA_character_
+    ),
+    MET_cat_num = case_when(
+      MET_cat_label == "Low" ~ 1,
+      MET_cat_label == "Moderate" ~ 2,
+      MET_cat_label == "High" ~ 3,
+      TRUE ~ NA_real_
+    ),
+    # Categorize sedentary time (minutes per day)
+    sedentary_min = as.numeric(PAD680),
+    sedentary_cat_label = case_when(
+      sedentary_min < 360 ~ "<6h",
+      sedentary_min >= 360 & sedentary_min <= 480 ~ "6-8h",
+      sedentary_min > 480 ~ ">8h",
+      TRUE ~ NA_character_
+    ),
+    sedentary_cat_num = case_when(
+      sedentary_cat_label == "<6h" ~ 1,
+      sedentary_cat_label == "6-8h" ~ 2,
+      sedentary_cat_label == ">8h" ~ 3,
+      TRUE ~ NA_real_
+    )
+  )
+# Outlier truncation (Winsorization/Cleaning)
+final_data <- final_data %>%
+  mutate(
+    # 1. Truncate MET scores at 30,000 according to IPAQ protocols to minimize outlier influence
+    MET_total = pmin(MET_total, 30000),
+    
+    # 2. Truncate sedentary time at 16 hours (960 min) to reflect biological plausibility
+    sedentary_min = pmin(sedentary_min, 960) 
+  )
+# -------------------------------------------------------------------------
+# 5. Data Storage
+# -------------------------------------------------------------------------
+if(!dir.exists("D:/code")) dir.create("D:/code", recursive = TRUE)
+saveRDS(final_data, "D:/code/10.data.rds")
+
+message("Processing complete. Dataset saved to D:/code/10.data.rds")
+
+# -------------------------------------------------------------------------
+# 6. Data Validation and Descriptive Summary
+# -------------------------------------------------------------------------
+
+# 6.1 Verify cleaning of invalid codes (Expect counts of 0)check_outliers <- final_data %>%
+check_outliers <- final_data %>%
+  summarise(
+    Max_Sedentary_min = max(sedentary_min, na.rm = TRUE),
+    Max_MET_total = max(MET_total, na.rm = TRUE),
+    
+    NA_Sedentary = sum(is.na(sedentary_min)),
+    NA_MET = sum(is.na(MET_total))
+  )
+
+print("--- Descriptive Summary for Methodology Section ---")
+print(check_outliers)
+
+# --- 6.2 Distribution of continuous variables
+print("--- Summary Statistics (MET-min and Sedentary min) ---")
+summary(final_data[, c("MET_total", "sedentary_min")])
+
+# --- 6.3 Frequency distribution of categorical variables
+print("--- Frequency: MET Categories ---")
+table(final_data$MET_cat_label, useNA = "always")
+
+print("--- Frequency: Sedentary Time Categories ---")
+table(final_data$sedentary_cat_label, useNA = "always")
+
+# --- 6.4 Cross-tabulation: Numeric vs. Character labels
+print("--- Cross-tabulation: MET Category Mapping ---")
+table(Label = final_data$MET_cat_label, Num = final_data$MET_cat_num, useNA = "ifany")
+
+print("--- Cross-tabulation: Sedentary Category Mapping ---")
+table(Label = final_data$sedentary_cat_label, Num = final_data$sedentary_cat_num, useNA = "ifany")
