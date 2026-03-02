@@ -1,0 +1,64 @@
+################################################################################
+# Script Name: 6. Covariate Processing - Alcohol Consumption (NHANES 2017-2023)
+# Purpose: Harmonize alcohol status using strict numeric code matching.
+# Definitions: 0: Never (111=2), 1: Moderate (111=1, 151=2), 2: Heavy (151=1)
+# Output: Cleaned Alcohol Dataset (6.data.rds)
+################################################################################
+
+# 1. Environment & Libraries ---------------------------------------------------
+library(nhanesA)
+library(tidyverse)
+
+export_dir <- "D:/code"
+if (!dir.exists(export_dir)) dir.create(export_dir, recursive = TRUE)
+
+# 2. Data Retrieval & Processing Function --------------------------------------
+fetch_alq <- function(table_name, cycle_label) {
+  cat("Processing Cycle:", cycle_label, "...\n")
+  
+  # nhanes() returns factors by default; as.numeric() retrieves underlying SAS codes
+  raw_data <- nhanes(table_name)
+  
+  processed <- raw_data %>%
+    select(SEQN, ALQ111, ALQ151) %>%
+    mutate(
+      # Extract raw numeric codes for precise matching
+      a111_code = as.numeric(ALQ111),
+      a151_code = as.numeric(ALQ151),
+      
+      # 3-level Alcohol Status based on numeric codes:
+      # Level 0: Never drinkers (Code 2: No to 12 drinks in life)
+      # Level 1: Ever drinkers but not heavy (Code 2: No to 4/5+ drinks daily)
+      # Level 2: Heavy drinkers (Code 1: Yes to 4/5+ drinks daily)
+      Alcohol_Status = case_when(
+        a111_code == 2 ~ 0,
+        (a111_code == 1 | is.na(a111_code)) & a151_code == 2 ~ 1,
+        (a111_code == 1 | is.na(a111_code)) & a151_code == 1 ~ 2,
+        TRUE ~ NA_real_ # Handles Codes 7, 9 and Missing
+      ),
+      CYCLE = cycle_label
+    ) %>%
+    select(SEQN, Alcohol_Status, CYCLE)
+  
+  return(processed)
+}
+
+# 3. Execution & Merging -------------------------------------------------------
+alq_1720 <- fetch_alq("P_ALQ", "2017-2020")
+alq_2123 <- fetch_alq("ALQ_L", "2021-2023")
+
+alcohol_combined <- bind_rows(alq_1720, alq_2123)
+
+# 4. Quality Control & Export --------------------------------------------------
+# Add labels for visualization
+alcohol_combined <- alcohol_combined %>%
+  mutate(Alcohol_Label = factor(Alcohol_Status, 
+                                levels = c(0, 1, 2),
+                                labels = c("Never Drinker", "Moderate/Ever Drinker", "Heavy Drinker")))
+
+cat("\n--- Final Alcohol Distribution (Numeric-based) ---\n")
+print(table(alcohol_combined$Alcohol_Label, useNA = "always"))
+
+save_path <- file.path(export_dir, "6.data.rds")
+saveRDS(alcohol_combined, save_path)
+cat("\nAlcohol data successfully exported to:", save_path, "\n")
