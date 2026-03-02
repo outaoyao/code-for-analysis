@@ -1,0 +1,347 @@
+################################################################################
+# Script: NHANES Descriptive Statistics with Rao-Scott Chi-square Test
+# Description: Generate Table 1 with unweighted frequencies (weighted percentages)
+#              and Rao-Scott chi-square test for group comparisons
+################################################################################
+
+library(tidyverse)
+library(survey)
+
+# 1. Load Data -----------------------------------------------------------------
+setwd("D:/code")
+df_final <- readRDS("12.Dataset.rds")
+
+# 2. Prepare Data --------------------------------------------------------------
+# Categorical variables
+cat_vars <- c(
+  "RIAGENDR", "RIDRETH1", "DMDEDUC2", "DMDMARTZ",
+  "smoke_status", "Alcohol_Status",
+  "Age_cat", "PIR_cat", "BMI_cat", "dur_wd_cat",
+  "diabetes_status", "htn_status", "work_status", "dur_we_cat",
+  "sedentary_cat_label", "MET_cat_label"
+)
+
+# Convert depression variable to factor
+df_final$Moderate_depression_above <- factor(df_final$Moderate_depression_above, 
+                                             levels = c(0, 1), 
+                                             labels = c("No Depression", "With Depression"))
+
+# Ensure all categorical variables are factors with proper labels
+df_final$RIAGENDR <- factor(df_final$RIAGENDR, levels = c(1, 2), 
+                            labels = c("Male", "Female"))
+
+df_final$RIDRETH1 <- factor(df_final$RIDRETH1, levels = 1:5,
+                            labels = c("Mexican American", "Other Hispanic", 
+                                       "Non-Hispanic White", "Non-Hispanic Black", 
+                                       "Other Race"))
+
+df_final$DMDEDUC2 <- factor(df_final$DMDEDUC2, levels = 1:5,
+                            labels = c("Less than 9th grade", "9-11th grade", 
+                                       "High school graduate/GED", "Some college or AA degree", 
+                                       "College graduate or above"))
+
+df_final$DMDMARTZ <- factor(df_final$DMDMARTZ, levels = 1:3,
+                            labels = c("Married/Living with Partner", 
+                                       "Widowed/Divorced/Separated", "Never married"))
+
+# For other variables, just ensure they are factors
+other_vars <- setdiff(cat_vars, c("RIAGENDR", "RIDRETH1", "DMDEDUC2", "DMDMARTZ"))
+for (var in other_vars) {
+  df_final[[var]] <- factor(df_final[[var]])
+}
+
+# 3. Survey Design -------------------------------------------------------------
+nhanes_design <- svydesign(
+  id = ~SDMVPSU,
+  strata = ~SDMVSTRA,
+  weights = ~mec_adj,
+  nest = TRUE,
+  data = df_final
+)
+
+# 4. Summary Statistics --------------------------------------------------------
+cat("--- SUMMARY STATISTICS ---\n")
+
+total_unweighted <- nrow(df_final)
+depression_dist <- table(df_final$Moderate_depression_above)
+
+cat("Total Unweighted N:", total_unweighted, "\n")
+cat("No Depression:", depression_dist["No Depression"], "\n")
+cat("With Depression:", depression_dist["With Depression"], "\n\n")
+
+# 5. Generate Descriptive Statistics Table -------------------------------------
+cat("\n--- GENERATING TABLE 1 ---\n")
+
+# Variable labels for display
+var_labels <- c(
+  "RIAGENDR" = "Gender",
+  "RIDRETH1" = "Race",
+  "DMDEDUC2" = "Education Level",
+  "DMDMARTZ" = "Marital Status",
+  "smoke_status" = "Smoking Status",
+  "Alcohol_Status" = "Alcohol Use",
+  "Age_cat" = "Age Group (Years)",
+  "PIR_cat" = "Family Income (PIR)",
+  "BMI_cat" = "Body mass index（kg/m²）",
+  "dur_wd_cat" = "Weekday sleep duration（h）",
+  "diabetes_status" = "Diabetes",
+  "htn_status" = "Hypertension",
+  "work_status" = "Type of work done last week",
+  "dur_we_cat" = "Weekend sleep duration（h）",
+  "sedentary_cat_label" = "Sedentary Time（h）",
+  "MET_cat_label" = "Recreational activities"
+)
+
+# Prepare results
+results_list <- list()
+
+# Add header rows
+results_list[[1]] <- data.frame(
+  Variable = "",
+  Overall = sprintf("%d (100.00%%)", total_unweighted),
+  No_Depression = sprintf("%d (100.00%%)", depression_dist["No Depression"]),
+  With_Depression = sprintf("%d (100.00%%)", depression_dist["With Depression"]),
+  P_Value = "",
+  stringsAsFactors = FALSE
+)
+
+results_list[[2]] <- data.frame(
+  Variable = "Unweighted frequency (weighted percentage)",
+  Overall = sprintf("%d (100.00%%)", total_unweighted),
+  No_Depression = sprintf("%d (100.00%%)", depression_dist["No Depression"]),
+  With_Depression = sprintf("%d (100.00%%)", depression_dist["With Depression"]),
+  P_Value = "",
+  stringsAsFactors = FALSE
+)
+
+# Function to get weighted percentage using svytable
+get_weighted_percentage <- function(var_name, category_value, design_obj, group = NULL) {
+  # If filtering by group
+  if (!is.null(group)) {
+    design_obj <- subset(design_obj, Moderate_depression_above == group)
+  }
+  
+  # Check if design has data
+  if (length(design_obj) == 0) {
+    return(0)
+  }
+  
+  # Get weighted table
+  formula <- as.formula(paste("~", var_name))
+  weighted_table <- svytable(formula, design_obj)
+  
+  # Find the category
+  if (category_value %in% names(weighted_table)) {
+    # Calculate percentage
+    total <- sum(weighted_table)
+    percentage <- (weighted_table[category_value] / total) * 100
+    return(as.numeric(percentage))
+  } else {
+    return(0)
+  }
+}
+
+# Process each variable
+for (var in cat_vars) {
+  cat("Processing:", var, "\n")
+  
+  # Get categories
+  categories <- levels(df_final[[var]])
+  
+  # Get Rao-Scott chi-square p-value
+  formula_chi <- as.formula(paste("~", var, "+ Moderate_depression_above"))
+  chi_test <- tryCatch({
+    svychisq(formula_chi, design = nhanes_design, statistic = "Wald")
+  }, error = function(e) {
+    cat("Warning: Chi-square test failed for", var, "-", e$message, "\n")
+    return(NULL)
+  })
+  
+  p_value <- if (!is.null(chi_test)) {
+    if (chi_test$p.value < 0.001) {
+      "<0.001"
+    } else {
+      sprintf("%.3f", chi_test$p.value)
+    }
+  } else {
+    "NA"
+  }
+  
+  # Add variable name row (with P-value, no percentages)
+  results_list[[length(results_list) + 1]] <- data.frame(
+    Variable = var_labels[var],
+    Overall = "",
+    No_Depression = "",
+    With_Depression = "",
+    P_Value = p_value,
+    stringsAsFactors = FALSE
+  )
+  
+  # Process each category
+  for (category in categories) {
+    # Get unweighted counts
+    overall_count <- sum(df_final[[var]] == category, na.rm = TRUE)
+    nodep_count <- sum(df_final[[var]] == category & 
+                         df_final$Moderate_depression_above == "No Depression", na.rm = TRUE)
+    dep_count <- sum(df_final[[var]] == category & 
+                       df_final$Moderate_depression_above == "With Depression", na.rm = TRUE)
+    
+    # Get weighted percentages
+    overall_pct <- get_weighted_percentage(var, category, nhanes_design)
+    nodep_pct <- get_weighted_percentage(var, category, nhanes_design, group = "No Depression")
+    dep_pct <- get_weighted_percentage(var, category, nhanes_design, group = "With Depression")
+    
+    # Round to 2 decimal places
+    overall_pct <- round(overall_pct, 2)
+    nodep_pct <- round(nodep_pct, 2)
+    dep_pct <- round(dep_pct, 2)
+    
+    # Add category row
+    results_list[[length(results_list) + 1]] <- data.frame(
+      Variable = paste0("  ", as.character(category)),
+      Overall = sprintf("%d (%.2f%%)", overall_count, overall_pct),
+      No_Depression = sprintf("%d (%.2f%%)", nodep_count, nodep_pct),
+      With_Depression = sprintf("%d (%.2f%%)", dep_count, dep_pct),
+      P_Value = "",
+      stringsAsFactors = FALSE
+    )
+  }
+}
+
+# Combine all results
+final_table <- do.call(rbind, results_list)
+
+# 6. Display Results -----------------------------------------------------------
+cat("\n--- FINAL TABLE 1 (COMPLETE) ---\n")
+cat("Categorical variables are presented as unweighted frequencies (weighted percentages).\n")
+cat("Group comparisons were performed using Rao-Scott adjusted chi-square test.\n")
+cat("Significance level was set at P < 0.05 (two-tailed).\n\n")
+
+# 7. Verify Percentage Sums ----------------------------------------------------
+cat("\n--- VERIFYING PERCENTAGE SUMS ---\n")
+
+# Verify all variables
+cat("\nVerifying that percentages sum to 100% for each variable:\n")
+for (var in cat_vars) {
+  var_label <- var_labels[var]
+  var_row <- which(final_table$Variable == var_label)
+  
+  if (length(var_row) > 0) {
+    # Get all category rows for this variable
+    categories <- levels(df_final[[var]])
+    category_rows <- final_table[(var_row + 1):(var_row + length(categories)), ]
+    
+    # Extract percentages
+    extract_percentage <- function(x) {
+      # Extract number between parentheses
+      match <- regmatches(x, regexpr("\\([0-9.]+%\\)", x))
+      if (length(match) > 0) {
+        # Remove parentheses and % sign
+        num <- gsub("[()%]", "", match)
+        return(as.numeric(num))
+      } else {
+        return(0)
+      }
+    }
+    
+    overall_pcts <- sapply(category_rows$Overall, extract_percentage)
+    nodep_pcts <- sapply(category_rows$No_Depression, extract_percentage)
+    dep_pcts <- sapply(category_rows$With_Depression, extract_percentage)
+    
+    # Calculate sums
+    sum_overall <- sum(overall_pcts, na.rm = TRUE)
+    sum_nodep <- sum(nodep_pcts, na.rm = TRUE)
+    sum_dep <- sum(dep_pcts, na.rm = TRUE)
+    
+    # Check if sums are close to 100%
+    check_overall <- abs(sum_overall - 100) < 0.1
+    check_nodep <- abs(sum_nodep - 100) < 0.1
+    check_dep <- abs(sum_dep - 100) < 0.1
+    
+    all_ok <- check_overall & check_nodep & check_dep
+    
+    status <- if (all_ok) "✓" else "✗"
+    
+    if (!all_ok) {
+      cat(sprintf("%s %-25s: Overall=%.2f%%, No Depression=%.2f%%, With Depression=%.2f%%\n",
+                  status, var_label, sum_overall, sum_nodep, sum_dep))
+    }
+  }
+}
+
+# 8. Export to CSV -------------------------------------------------------------
+write.csv(final_table, "Table1_Full_Complete.csv", row.names = FALSE, na = "")
+cat("\n\nTable exported to: Table1_Full_Complete.csv\n")
+
+# 9. Print Complete Table ------------------------------------------------------
+cat("\n--- COMPLETE TABLE 1 ---\n")
+cat("======================================================================\n\n")
+
+cat("Table 1. Characteristics of Study Participants by Depression Status\n\n")
+
+# Display the complete table in a clean format
+cat("Format: Unweighted frequency (weighted percentage %)\n")
+cat("Statistical test: Rao-Scott adjusted chi-square test\n")
+cat("Significance level: P < 0.05 (two-tailed)\n\n")
+
+# Print the COMPLETE table
+cat(rep("-", 130), "\n", sep = "")
+cat(sprintf("%-40s %-25s %-25s %-25s %-10s\n",
+            "Characteristic", "Overall", "No Depression", 
+            "With Depression", "P Value"))
+cat(rep("-", 130), "\n", sep = "")
+
+# Print ALL rows
+for (i in 1:nrow(final_table)) {
+  cat(sprintf("%-40s %-25s %-25s %-25s %-10s\n",
+              final_table$Variable[i],
+              final_table$Overall[i],
+              final_table$No_Depression[i],
+              final_table$With_Depression[i],
+              final_table$P_Value[i]))
+}
+
+cat(rep("-", 130), "\n", sep = "")
+
+# 10. Print Summary Statistics -------------------------------------------------
+cat("\n--- SUMMARY STATISTICS ---\n")
+cat("Total sample size (unweighted):", total_unweighted, "\n")
+cat("No Depression group:", depression_dist["No Depression"], "\n")
+cat("With Depression group:", depression_dist["With Depression"], "\n")
+
+# Create summary of significant variables
+cat("\nSignificant variables (P < 0.05):\n")
+p_value_rows <- final_table[final_table$P_Value != "" & final_table$P_Value != "NA", ]
+significant_vars <- p_value_rows[p_value_rows$P_Value != "" & p_value_rows$P_Value != "NA", ]
+
+sig_vars_list <- c()
+for (i in 1:nrow(significant_vars)) {
+  var_name <- significant_vars$Variable[i]
+  p_val <- significant_vars$P_Value[i]
+  
+  if (p_val == "<0.001" || (p_val != "NA" && as.numeric(p_val) < 0.05)) {
+    sig_vars_list <- c(sig_vars_list, paste0(var_name, " (P = ", p_val, ")"))
+  }
+}
+
+if (length(sig_vars_list) > 0) {
+  for (i in seq_along(sig_vars_list)) {
+    cat(sprintf("%2d. %s\n", i, sig_vars_list[i]))
+  }
+} else {
+  cat("No significant variables found.\n")
+}
+
+cat("\nTotal variables analyzed:", length(cat_vars), "\n")
+cat("Significant variables:", length(sig_vars_list), "\n")
+cat("Non-significant variables:", length(cat_vars) - length(sig_vars_list), "\n")
+
+
+weighted_population <- sum(weights(nhanes_design))
+cat("\nWeighted population represented by 10,137 participants:", 
+    format(round(weighted_population), big.mark = ","), "\n")
+
+
+weighted_depression <- svytable(~Moderate_depression_above, nhanes_design)
+cat("Depression weighted count:", format(round(weighted_depression["With Depression"]), big.mark = ","), 
+    sprintf("(%.2f%%)", prop.table(weighted_depression)["With Depression"] * 100), "\n")
