@@ -1,0 +1,362 @@
+# Load required library
+library(dplyr)
+
+# 1. Load datasets
+data_raw <- readRDS("D:/code/2.data.rds")
+dataset_base <- readRDS("D:/code/17.Dataset.rds")
+
+# 2. Extract DPQ090 and identifier (assumed to be 'SEQN' or 'ID')
+# We identify the common ID column automatically for merging
+common_id <- intersect(names(data_raw), names(dataset_base))
+
+if (length(common_id) == 0) {
+  stop("No common ID variable found between the two datasets.")
+}
+
+dpq_subset <- data_raw %>%
+  select(all_of(common_id), DPQ090)
+
+# 3. Merge DPQ090 into the base dataset
+# Using left_join ensures the final dataset matches the cases in 17.Dataset.rds
+# Cases in 2.data.rds that do not exist in 17.Dataset.rds are excluded
+dataset_merged <- dataset_base %>%
+  left_join(dpq_subset, by = common_id)
+
+# 4. Statistical summary of DPQ090 frequency before exclusion
+cat("Frequency distribution of DPQ090 (Post-merge):\n")
+print(table(dataset_merged$DPQ090, useNA = "ifany"))
+
+# 5. Sensitivity Analysis: Exclude cases where DPQ090 equals 3
+# This step creates the restricted cohort for sensitivity testing
+dataset_sensitivity <- dataset_merged %>%
+  filter(DPQ090 != 3 | is.na(DPQ090))
+
+# 6. Statistical summary of DPQ090 frequency after exclusion
+cat("\nFrequency distribution of DPQ090 (After excluding value 3):\n")
+print(table(dataset_sensitivity$DPQ090, useNA = "ifany"))
+
+# 7. Save the final processed dataset for sensitivity analysis
+saveRDS(dataset_sensitivity, "D:/code/17.1Dataset sensitivity analysis.rds")
+
+cat("\nProcessing complete. File saved as '17.1Dataset sensitivity analysis.rds'.\n")
+
+
+
+################################################################################
+# STUDY: Multidimensional Circadian Misalignment and Depression (NHANES)
+# ANALYSIS: Sensitivity Analysis with Weighted Logistic Regression
+################################################################################
+
+# 8. Load Essential Libraries --------------------------------------------------
+library(survey)
+library(rms)
+library(purrr)
+library(broom)
+library(dplyr)
+
+# 9. Load the Sensitivity Dataset ----------------------------------------------
+# Calling the specific dataset generated in the previous step
+nhanes_final <- readRDS("D:/code/17.1Dataset sensitivity analysis.rds")
+
+# 10. Helper Function for Results Extraction -----------------------------------
+# Required for 'results_summary' and 'Standardized OR'
+extract_or <- function(model, label, var_name = "CMB_Score") {
+  res <- tidy(model, exponentiate = TRUE, conf.int = TRUE) %>%
+    filter(term == var_name) %>%
+    mutate(Model = label) %>%
+    select(Model, estimate, conf.low, conf.high, p.value)
+  return(res)
+}
+
+# 11. Academic Factorization ---------------------------------------------------
+cat("\n>>> Step 1: Factorizing categorical variables... <<<\n")
+nhanes_final <- nhanes_final %>%
+  mutate(across(c(RIAGENDR, RIDRETH1, DMDEDUC2, smoke_status, DMDMARTZ, 
+                  Alcohol_Status, diabetes_status, htn_status, work_status), as.factor))
+
+# 12. Survey Design Specification -----------------------------------------------
+cat("\n>>> Step 2: Configuring Survey Weights (MEC weights)... <<<\n")
+# Ensure no missing weights for design specification
+nhanes_final <- nhanes_final %>% filter(!is.na(mec_adj))
+
+design_base <- svydesign(id = ~SDMVPSU, strata = ~SDMVSTRA, weights = ~mec_adj, 
+                         data = nhanes_final, nest = TRUE)
+
+# 13. Formal Weight-Adjusted Quartile Construction ------------------------------
+cat("\n>>> Step 3: Applying Fixed Quartile Cut-points from Main Analysis (Scheme B)... <<<\n")
+
+# Use fixed cut points from the main analysis to ensure clinical consistency
+# Fixed q_values: 1, 4, 7, 12, 18
+q_values_fixed <- c(1, 4, 7, 12, 18)
+
+# Incorporate the Fixed Quartiles into the Design Object
+# We use the breakpoints from the primary population (Scheme B)
+design_final <- update(design_base, 
+                       CMB_Q = cut(CMB_Score, 
+                                   breaks = q_values_fixed, 
+                                   include.lowest = TRUE, 
+                                   labels = FALSE),
+                       Score_z = as.numeric(scale(CMB_Score))
+)
+
+# Explicitly ensure CMB_Trend is treated as an ordinal numeric variable
+design_final <- update(design_final, CMB_Trend = as.numeric(CMB_Q))
+
+# Quick verification: Check the distribution of the fixed quartiles
+cat("Weighted distribution of fixed quartiles in sensitivity cohort:\n")
+print(svytable(~CMB_Q, design_final))
+
+# 14. Hierarchical Regression Analysis ------------------------------------------
+cat("\n>>> Step 4: Hierarchical Modeling... <<<\n")
+
+# Model 1: Unadjusted
+model1 <- svyglm(Moderate_depression_above ~ CMB_Score, design = design_final, family = quasibinomial())
+
+# Model 2: Adjusted for basic demographics
+model2 <- svyglm(Moderate_depression_above ~ CMB_Score + RIDAGEYR + RIAGENDR + RIDRETH1, 
+                 design = design_final, family = quasibinomial())
+
+# Model 3: Adjusted for demographics + lifestyle/socioeconomics
+model3 <- svyglm(Moderate_depression_above ~ CMB_Score + RIDAGEYR + RIAGENDR + RIDRETH1 + 
+                   DMDEDUC2 + smoke_status + DMDMARTZ + BMI_value + Alcohol_Status + 
+                   diabetes_status + htn_status + work_status + MET_total + INDFMPIR, 
+                 design = design_final, family = quasibinomial())
+
+# Model 4: Fully Adjusted (Model 3 + Sedentary behavior)
+model4 <- svyglm(Moderate_depression_above ~ CMB_Score + RIDAGEYR + RIAGENDR + RIDRETH1 + 
+                   DMDEDUC2 + smoke_status + DMDMARTZ + BMI_value + Alcohol_Status + 
+                   diabetes_status + htn_status + work_status + MET_total + INDFMPIR + 
+                   sedentary_min, design = design_final, family = quasibinomial())
+
+# Consolidated Table Construction
+results_summary <- rbind(
+  extract_or(model1, "Model 1: Crude"),
+  extract_or(model2, "Model 2: Demographic-adjusted"),
+  extract_or(model3, "Model 3: Lifestyle-adjusted"),
+  extract_or(model4, "Model 4: Fully adjusted")
+)
+print(results_summary)
+
+# 15. Standardized Effect and P-for-trend ---------------------------------------
+cat("\n>>> Step 5: Advanced Statistical Testing... <<<\n")
+
+# A. Standardized OR (per 1 SD increase)
+model_z <- svyglm(Moderate_depression_above ~ Score_z + RIDAGEYR + RIAGENDR + RIDRETH1 + 
+                    DMDEDUC2 + smoke_status + DMDMARTZ + BMI_value + Alcohol_Status + 
+                    diabetes_status + htn_status + work_status + MET_total + 
+                    INDFMPIR + sedentary_min, design = design_final, family = quasibinomial())
+
+res_z <- extract_or(model_z, "Standardized OR (per 1-SD increase)", "Score_z")
+
+# B. Formal Linear Trend Test (using Quartiles as ordinal values)
+model_trend <- svyglm(Moderate_depression_above ~ CMB_Trend + RIDAGEYR + RIAGENDR + RIDRETH1 + 
+                        DMDEDUC2 + smoke_status + DMDMARTZ + BMI_value + Alcohol_Status + 
+                        diabetes_status + htn_status + work_status + MET_total + 
+                        INDFMPIR + sedentary_min, design = design_final, family = quasibinomial())
+
+p_trend <- summary(model_trend)$coefficients["CMB_Trend", 4]
+
+# Final Outputs
+print(res_z)
+cat("\nFormal P-for-trend (Linear Trend Test):", format.pval(p_trend, eps = 0.001), "\n")
+
+# 16. Data Export ---------------------------------------------------------------
+# Saving the sensitivity-specific analysis results
+#saveRDS(nhanes_final, "D:/code/17.1Dataset sensitivity analysis_final.rds")
+cat("\n>>> SUCCESS: All models executed. Sensitivity analysis complete. <<<\n")
+
+################################################################################
+# VISUALIZATION: Sensitivity Analysis Forest Plot — v3
+# Layout fully matched to main analysis v9:
+#   - Removed "SENSITIVITY ANALYSIS" badge
+#   - P for trend placed BELOW standardized OR row (y = 0.60)
+#   - X-axis range, row spacing, theme identical to v9
+#   - Sensitivity context conveyed via title + subtitle only
+################################################################################
+
+library(ggplot2)
+library(dplyr)
+
+COL_MODEL <- "#E69F00"
+COL_STD   <- "#0072B2"
+COL_SHADE <- "#EEF2F7"
+
+extract_or_robust <- function(model, label, var_name = "CMB_Score") {
+  cf  <- summary(model)$coefficients
+  est <- cf[var_name, 1]
+  pv  <- cf[var_name, 4]
+  ci_log <- tryCatch(
+    confint(model)[var_name, ],
+    error = function(e) { se <- cf[var_name, 2]; c(est-1.96*se, est+1.96*se) }
+  )
+  data.frame(Model = label,
+             OR  = round(exp(est), 2),
+             LCI = round(exp(ci_log[1]), 2),
+             UCI = round(exp(ci_log[2]), 2),
+             P_val = pv, stringsAsFactors = FALSE)
+}
+
+plot_data_sa <- rbind(
+  extract_or_robust(model1,  "Model 1: Unadjusted"),
+  extract_or_robust(model2,  "Model 2: Demographic-adjusted"),
+  extract_or_robust(model3,  "Model 3: Lifestyle-adjusted"),
+  extract_or_robust(model4,  "Model 4: Fully adjusted"),
+  extract_or_robust(model_z, "Standardized OR\n(per 1-SD increase)",
+                    var_name = "Score_z")
+) %>%
+  mutate(
+    CI_label = sprintf("%.2f (%.2f\u2013%.2f)", OR, LCI, UCI),
+    P_label  = ifelse(P_val < 0.001, "<.001", sprintf("%.3f", P_val)),
+    is_std   = grepl("Standardized", Model),
+    pt_col   = ifelse(is_std, COL_STD, COL_MODEL),
+    pt_shp   = ifelse(is_std, 18L, 15L),
+    pt_size  = ifelse(is_std, 5.2, 4.0)
+  )
+
+n_sa               <- nrow(plot_data_sa)
+plot_data_sa$y_pos <- seq(n_sa, 1, by = -1)
+y_header_sa        <- n_sa + 0.85
+
+# X layout — identical to main analysis v9
+X_MIN      <- 0.85
+X_DATA_MAX <- 1.62
+X_CI       <- 1.68
+X_P        <- 2.08
+X_MAX      <- 2.55
+
+shade_df_sa <- plot_data_sa %>%
+  filter(y_pos %% 2 == 0) %>%
+  transmute(ymin = y_pos - 0.5, ymax = y_pos + 0.5)
+
+# P-for-trend from model object
+p_trend_val <- summary(model_trend)$coefficients["CMB_Trend", 4]
+p_trend_txt <- ifelse(
+  p_trend_val < 0.001,
+  "P for linear trend < 0.001",
+  paste0("P for linear trend = ", formatC(p_trend_val, digits = 3, format = "f"))
+)
+
+# Subtitle exclusion note
+n_excluded  <- 37
+n_remaining <- 9738 + 301 + 61
+sa_note <- sprintf(
+  "Participants endorsing suicidal ideation (DPQ090 = 3, n = %d) excluded; remaining n = %d.",
+  n_excluded, n_remaining
+)
+
+p_sa <- ggplot(plot_data_sa, aes(x = OR, y = y_pos)) +
+  
+  # Alternating shading
+  geom_rect(data = shade_df_sa,
+            aes(xmin = X_MIN, xmax = X_DATA_MAX, ymin = ymin, ymax = ymax),
+            fill = COL_SHADE, alpha = 0.65, inherit.aes = FALSE) +
+  
+  # Dotted separator
+  geom_hline(yintercept = 1.5, linetype = "dotted",
+             color = "gray45", linewidth = 0.55) +
+  
+  # Vertical divider
+  annotate("segment",
+           x = X_DATA_MAX, xend = X_DATA_MAX,
+           y = 0.3, yend = n_sa + 0.5,
+           color = "gray65", linewidth = 0.35) +
+  
+  # Reference line
+  geom_vline(xintercept = 1, linetype = "dashed",
+             color = "gray25", linewidth = 0.72) +
+  
+  # CI bars
+  geom_errorbar(aes(xmin = LCI, xmax = UCI, color = pt_col, y = y_pos),
+                orientation = "y", width = 0.22, linewidth = 0.95) +
+  
+  # Points
+  geom_point(aes(color = pt_col, shape = factor(pt_shp), size = pt_size)) +
+  
+  # ── P-for-trend: below standardized OR row ───────────────────────────────────
+  annotate("text",
+           x     = X_DATA_MAX - 0.03,
+           y     = 0.60,
+           label = p_trend_txt,
+           hjust = 1, vjust = 1,
+           size  = 3.2, fontface = "italic",
+           color = "#555555") +
+  
+  # Column headers
+  annotate("text", x = X_CI, y = y_header_sa,
+           label = "aOR (95% CI)", hjust = 0,
+           size = 3.8, fontface = "bold", color = "black") +
+  annotate("text", x = X_P, y = y_header_sa,
+           label = "P-value", hjust = 0,
+           size = 3.8, fontface = "bold", color = "black") +
+  
+  # aOR text
+  geom_text(data = plot_data_sa,
+            aes(x = X_CI, y = y_pos, label = CI_label),
+            hjust = 0, size = 3.35, color = "black", inherit.aes = FALSE) +
+  
+  # P-value text
+  geom_text(data = plot_data_sa,
+            aes(x = X_P, y = y_pos, label = P_label),
+            hjust = 0, size = 3.2, color = "#2c2c2c",
+            fontface = "italic", inherit.aes = FALSE) +
+  
+  scale_y_continuous(
+    breaks = plot_data_sa$y_pos,
+    labels = plot_data_sa$Model,
+    limits = c(0.25, n_sa + 1.2),
+    expand = c(0, 0)
+  ) +
+  scale_x_continuous(
+    limits = c(X_MIN, X_MAX),
+    breaks = c(0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5),
+    expand = c(0, 0)
+  ) +
+  scale_color_identity() +
+  scale_shape_manual(values = c("15" = 15, "18" = 18), guide = "none") +
+  scale_size_identity() +
+  
+  labs(
+    title    = "Sensitivity Analysis: Association Between Cumulative Circadian Misalignment Score and Depressive Symptoms",
+    subtitle = paste0(
+      "Adjusted Odds Ratios (95% CI) \u2014 Survey-Weighted Logistic Regression (NHANES)",
+      " \u2014 ", sa_note
+    ),
+    x        = "Adjusted Odds Ratio (95% CI)  |  per 1-unit increase in Cumulative Circadian Misalignment Score",
+    y        = NULL,
+    caption  = paste0(
+      "\u25a0  Orange squares (Models 1\u20134): aOR per 1-unit increase in CMB Score.\n",
+      "\u25c6  Blue diamond: standardized aOR per 1-SD increase (fully adjusted model).\n",
+      "CIs derived from t-distribution (confint()). ", p_trend_txt,
+      " (weighted quartiles as ordinal predictor, fully adjusted).\n",
+      "Quartile cut-points fixed to main analysis (Q1\u20134: 1\u20134, 4\u20137, 7\u201312, 12\u201318). ",
+      "Color palette: Okabe-Ito (color-blind safe)."
+    )
+  ) +
+  
+  theme_classic(base_size = 11) +
+  theme(
+    plot.title      = element_text(size = 12.5, face = "bold", hjust = 0,
+                                   margin = margin(b = 4)),
+    plot.subtitle   = element_text(size = 8.8, color = "#444444", hjust = 0,
+                                   margin = margin(b = 10), lineheight = 1.35),
+    plot.caption    = element_text(size = 7.8, color = "#666666", hjust = 0,
+                                   lineheight = 1.55, margin = margin(t = 10)),
+    axis.text.y     = element_text(size = 10, color = "black",
+                                   hjust = 1, lineheight = 1.25),
+    axis.text.x     = element_text(size = 9,  color = "black"),
+    axis.title.x    = element_text(size = 8.8, margin = margin(t = 7)),
+    axis.line.x     = element_line(color = "black", linewidth = 0.5),
+    axis.line.y     = element_blank(),
+    axis.ticks.y    = element_blank(),
+    legend.position = "none",
+    plot.margin     = margin(t = 14, r = 22, b = 14, l = 14)
+  ) +
+  coord_cartesian(clip = "off")
+
+ggsave("forest_plot_sensitivity_v3.pdf", plot = p_sa,
+       width = 15, height = 5.8, device = cairo_pdf)
+ggsave("forest_plot_sensitivity_v3.png", plot = p_sa,
+       width = 15, height = 5.8, dpi = 300)
+
+cat("\n[Done] Sensitivity analysis forest plot (v3) saved.\n")
+print(p_sa)
