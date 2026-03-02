@@ -1,0 +1,465 @@
+################################################################################
+# Study:    Multidimensional Circadian Misalignment and Depression
+# Analysis: Survey-Weighted Stratified Analysis and Forest Plot
+#           (Binary Exposure: CMB Risk Group)
+# Note: All associations are cross-sectional; no causal inference is implied.
+################################################################################
+
+# ==============================================================================
+# SECTION 0: Package Loading
+# ==============================================================================
+library(survey)
+library(dplyr)
+library(purrr)
+library(broom)
+library(ggplot2)
+
+# ==============================================================================
+# SECTION 1: User Configuration
+# ==============================================================================
+
+DATA_PATH   <- "D:/code/18.Dataset.rds"       # Path to input dataset (.rds)
+OUTPUT_DIR  <- "D:/code/output"               # Output directory (auto-created)
+PLOT_FILE   <- "forest_plot_subgroup.pdf"     # Output filename
+PLOT_WIDTH  <- 16                             # Plot width (inches)
+PLOT_HEIGHT <- 9                              # Plot height (inches)
+
+# ==============================================================================
+# SECTION 2: Data Loading and Variable Preparation
+# ==============================================================================
+
+cat(">>> [1/5] Loading dataset...\n")
+nhanes_data <- readRDS(DATA_PATH)
+risk_cut    <- levels(nhanes_data$CMB_Risk_Group)[2]
+
+cat(">>> [2/5] Recoding and factorizing variables...\n")
+nhanes_data <- nhanes_data %>%
+  mutate(
+    # --- Sociodemographic variables (covariates) ---
+    RIAGENDR        = factor(RIAGENDR, levels = c("Male", "Female")),
+    RIDRETH1        = factor(RIDRETH1),
+    DMDEDUC2        = factor(DMDEDUC2),
+    
+    # --- Behavioral and lifestyle variables (covariates) ---
+    smoke_status    = factor(smoke_status),
+    DMDMARTZ        = factor(DMDMARTZ),
+    AlcoholCategory = factor(AlcoholCategory),
+    
+    # --- Cardiometabolic comorbidity variables (covariates) ---
+    diabetes_status     = factor(diabetes_status),
+    hypertension_status = factor(hypertension_status),
+    work_status         = factor(work_status),
+    
+    # -----------------------------------------------------------------------
+    # Subgroup variables for BOTH interaction testing AND stratified OR display
+    # -----------------------------------------------------------------------
+    
+    # Sex
+    Sex_cat = factor(RIAGENDR, levels = c("Male", "Female")),
+    
+    # Age group — displayed with Unicode >=
+    Age_cat = factor(Age_cat_num,
+                     levels = c(2, 3, 4),
+                     labels = c("20-39", "40-59", "\u226560")),
+    
+    # BMI (3-level): Underweight + Normal weight merged as reference (<24.9)
+    # Categories displayed exactly as requested in the manuscript figure
+    BMI_cat = factor(
+      ifelse(BMI_cat_ordinal %in% c(1, 2), 1L,
+             ifelse(BMI_cat_ordinal == 3,         2L,
+                    ifelse(BMI_cat_ordinal == 4,         3L, NA_integer_))),
+      levels = 1:3,
+      labels = c(
+        "Normal weight or below (<24.9)",
+        "Overweight (25-29.9)",
+        "Obese (\u226530)"
+      )
+    ),
+    
+    # Weekday sleep duration
+    Dur_wd_cat = factor(dur_wd_cat_num,
+                        levels = 1:3,
+                        labels = c("7-9", "<7", "\u22659")),
+    
+    # -----------------------------------------------------------------------
+    # Additional subgroup variables for INTERACTION TESTING ONLY
+    # -----------------------------------------------------------------------
+    PIR_cat = factor(PIR_cat_num,
+                     levels = c(1, 2, 3),
+                     labels = c("<1.30", "1.30-3.50", "\u22653.50")),
+    
+    Dur_we_cat = factor(dur_we_cat_num,
+                        levels = 1:3,
+                        labels = c("7-9 hours", "<7 hours", "\u22659 hours")),
+    
+    Sedentary_cat = factor(sedentary_cat_num,
+                           levels = 1:3,
+                           labels = c("<6 h/day", "6-8 h/day", ">8 h/day")),
+    
+    MET_cat = factor(MET_cat_num,
+                     levels = 1:3,
+                     labels = c("Low", "Moderate", "High"))
+  )
+
+# Diagnostic: verify BMI recoding
+cat("\n--- Unweighted BMI distribution (3-level, Underweight merged into Normal) ---\n")
+print(table(nhanes_data$BMI_cat, useNA = "always"))
+
+# ==============================================================================
+# SECTION 3: Complex Survey Design Specification
+# ==============================================================================
+
+cat("\n>>> [3/5] Specifying complex survey design (NHANES MEC weights)...\n")
+
+options(survey.lonely.psu = "adjust")
+
+design <- svydesign(
+  id      = ~SDMVPSU,
+  strata  = ~SDMVSTRA,
+  weights = ~mec_adj,
+  data    = nhanes_data,
+  nest    = TRUE
+)
+
+# ==============================================================================
+# SECTION 4: Analytic Variable Definitions
+# ==============================================================================
+
+# ALL 16 subgroup variables — interaction P-value computed for each
+all_subgroup_vars <- c(
+  "Sex_cat", "Age_cat", "RIDRETH1", "DMDEDUC2",
+  "smoke_status", "DMDMARTZ", "BMI_cat", "AlcoholCategory",
+  "diabetes_status", "hypertension_status", "work_status",
+  "PIR_cat", "Dur_wd_cat", "Dur_we_cat", "Sedentary_cat", "MET_cat"
+)
+
+# 4 pre-specified variables — stratum-specific ORs estimated and plotted
+plot_subgroup_vars <- c("Sex_cat", "Age_cat", "BMI_cat", "Dur_wd_cat")
+
+# Redundancy map: drops the continuous/original counterpart from the
+# adjustment set when its categorical version is used as stratifier,
+# preventing collinearity in stratum-specific models.
+redundancy_map <- list(
+  Sex_cat             = "RIAGENDR",
+  Age_cat             = "RIDAGEYR",
+  BMI_cat             = "BMI_value",
+  Dur_wd_cat          = "dur_wd_cat_num",
+  PIR_cat             = "INDFMPIR",
+  Sedentary_cat       = "sedentary_min",
+  MET_cat             = "MET_total",
+  RIDRETH1            = NULL,
+  DMDEDUC2            = NULL,
+  smoke_status        = NULL,
+  DMDMARTZ            = NULL,
+  AlcoholCategory     = NULL,
+  diabetes_status     = NULL,
+  hypertension_status = NULL,
+  work_status         = NULL,
+  Dur_we_cat          = NULL
+)
+
+# Full covariate adjustment set for multivariable models
+all_covs <- c(
+  "RIDAGEYR", "RIAGENDR", "RIDRETH1", "DMDEDUC2",
+  "smoke_status", "DMDMARTZ", "BMI_value", "AlcoholCategory",
+  "diabetes_status", "hypertension_status", "work_status",
+  "MET_total", "INDFMPIR", "sedentary_min"
+)
+
+# ==============================================================================
+# SECTION 5: Stratified Analysis Engine
+# ==============================================================================
+
+#' Compute interaction P-value and (optionally) stratum-specific ORs
+#' for a single subgroup variable.
+#'
+#' Interaction is assessed via a Wald test of the product term
+#' (CMB_Risk_Group x subgroup variable) in the full adjusted model.
+#' Stratum-specific ORs are estimated only for variables in
+#' `plot_subgroup_vars`. Strata with n < 50 are excluded per NHANES
+#' domain estimation guidelines.
+#'
+#' @param sub_var        Character. Subgroup variable name.
+#' @param compute_strata Logical. Whether to estimate stratum-specific ORs.
+#' @return Data frame with OR estimates and interaction P-value.
+
+run_subgroup_analysis <- function(sub_var,
+                                  compute_strata = sub_var %in% plot_subgroup_vars) {
+  cat("  [Interaction]", sub_var,
+      if (compute_strata) "+ [Stratified ORs]" else "", "\n")
+  
+  # Step 5.1 -- Remove collinear counterpart from covariate set
+  vars_to_remove <- c(sub_var, redundancy_map[[sub_var]])
+  clean_covs     <- setdiff(all_covs, vars_to_remove)
+  
+  # Step 5.2 -- Global test for effect modification (P-for-interaction)
+  # Multiplicative interaction term introduced into the fully adjusted model.
+  # The Wald test p-value reflects whether the association between
+  # CMB_Risk_Group and depression symptom burden differs across strata.
+  formula_int <- as.formula(paste0(
+    "Moderate_depression_above ~ CMB_Risk_Group * ", sub_var, " + ",
+    paste(clean_covs, collapse = " + ")
+  ))
+  
+  model_int <- tryCatch(
+    svyglm(formula_int, design = design, family = quasibinomial()),
+    error = function(e) NULL
+  )
+  
+  p_int_val <- tryCatch({
+    if (!is.null(model_int))
+      regTermTest(model_int, paste0("CMB_Risk_Group:", sub_var))$p
+    else NA
+  }, error = function(e) NA)
+  
+  # Return interaction-only row for non-plot variables
+  if (!compute_strata) {
+    return(data.frame(
+      Subgroup      = sub_var,
+      Level         = NA_character_,
+      estimate      = NA_real_,
+      conf.low      = NA_real_,
+      conf.high     = NA_real_,
+      P_Interaction = p_int_val,
+      plot_stratum  = FALSE
+    ))
+  }
+  
+  # Step 5.3 -- Stratum-specific adjusted OR estimation
+  lvls <- na.omit(levels(droplevels(nhanes_data[[sub_var]])))
+  
+  strat_results <- map_df(lvls, function(lvl) {
+    idx             <- nhanes_data[[sub_var]] == lvl
+    idx[is.na(idx)] <- FALSE
+    
+    # Skip strata with n < 50 (NHANES domain estimation guideline)
+    if (sum(idx) < 50) return(NULL)
+    
+    sub_design <- subset(design, idx)
+    
+    formula_strat <- as.formula(paste0(
+      "Moderate_depression_above ~ CMB_Risk_Group + ",
+      paste(clean_covs, collapse = " + ")
+    ))
+    
+    model_strat <- tryCatch(
+      svyglm(formula_strat, design = sub_design, family = quasibinomial()),
+      error = function(e) NULL
+    )
+    
+    if (is.null(model_strat)) return(NULL)
+    
+    tidy(model_strat, conf.int = TRUE, exponentiate = TRUE) %>%
+      filter(grepl("Higher Exposure", term)) %>%
+      mutate(
+        Subgroup      = sub_var,
+        Level         = lvl,
+        P_Interaction = p_int_val,
+        plot_stratum  = TRUE
+      )
+  })
+  
+  strat_results
+}
+
+# ==============================================================================
+# SECTION 6: Execute Analyses
+# ==============================================================================
+
+cat("\n>>> [4/5] Running analyses...\n")
+cat("    Interaction testing:   all", length(all_subgroup_vars), "variables\n")
+cat("    Stratified OR display:", length(plot_subgroup_vars), "variables\n\n")
+
+raw_results <- map_df(all_subgroup_vars, run_subgroup_analysis)
+
+# ==============================================================================
+# SECTION 7: Result Aggregation and Multiple Testing Correction
+# ==============================================================================
+
+# FDR correction pooled across ALL 16 interaction P-values
+interaction_summary <- raw_results %>%
+  group_by(Subgroup) %>%
+  summarise(P_raw = first(P_Interaction), .groups = "drop") %>%
+  mutate(P_FDR = p.adjust(P_raw, method = "fdr"))
+
+# Forest plot header labels — match manuscript figure exactly
+label_map <- c(
+  Sex_cat             = "Gender",
+  Age_cat             = "Age Group (Years)",
+  RIDRETH1            = "Race/Ethnicity",
+  DMDEDUC2            = "Education Level",
+  smoke_status        = "Smoking Status",
+  DMDMARTZ            = "Marital Status",
+  BMI_cat             = "Body Mass Index (kg/m\u00b2)",
+  AlcoholCategory     = "Alcohol Consumption",
+  diabetes_status     = "Diabetes Status",
+  hypertension_status = "Hypertension Status",
+  work_status         = "Employment Status",
+  PIR_cat             = "Family Income-to-Poverty Ratio",
+  Dur_wd_cat          = "Weekday Sleep Duration (h)",
+  Dur_we_cat          = "Weekend Sleep Duration",
+  Sedentary_cat       = "Daily Sedentary Time",
+  MET_cat             = "Physical Activity Level (MET)"
+)
+
+# Restrict to 4 plot variables and attach FDR-corrected interaction P-values
+plot_ready <- raw_results %>%
+  filter(plot_stratum == TRUE) %>%
+  left_join(interaction_summary, by = "Subgroup") %>%
+  mutate(
+    Subgroup_Label = dplyr::recode(Subgroup, !!!label_map, .default = Subgroup)
+  )
+
+# Enforce display order matching the manuscript
+subgroup_order <- c(
+  "Gender",
+  "Age Group (Years)",
+  "Body Mass Index (kg/m\u00b2)",
+  "Weekday Sleep Duration (h)"
+)
+
+plot_ready <- plot_ready %>%
+  mutate(Subgroup_Label = factor(Subgroup_Label, levels = subgroup_order))
+
+# Build plot data frame with bold category header rows
+final_plot_df <- data.frame()
+
+for (sub in subgroup_order) {
+  sub_data <- filter(plot_ready, Subgroup_Label == sub)
+  if (nrow(sub_data) == 0) next
+  
+  header <- data.frame(
+    Subgroup_Label = sub,
+    Level          = sub,
+    OR             = NA,
+    LCI            = NA,
+    UCI            = NA,
+    P_FDR          = sub_data$P_FDR[1],
+    is_header      = TRUE
+  )
+  
+  levels_df <- sub_data %>%
+    mutate(is_header = FALSE) %>%
+    select(
+      Subgroup_Label,
+      Level,
+      OR        = estimate,
+      LCI       = conf.low,
+      UCI       = conf.high,
+      P_FDR,
+      is_header
+    )
+  
+  final_plot_df <- rbind(final_plot_df, header, levels_df)
+}
+
+final_plot_df <- final_plot_df %>%
+  mutate(
+    Plot_ID     = rev(row_number()),
+    Stats_Label = ifelse(is_header, "",
+                         sprintf("%.2f (%.2f, %.2f)", OR, LCI, UCI)),
+    P_Int_Label = ifelse(is_header,
+                         sprintf("P-interaction : %.3f", P_FDR),
+                         ""),
+    Level_Final = ifelse(is_header,
+                         as.character(Level),
+                         paste0("  ", Level))
+  )
+
+# ==============================================================================
+# SECTION 8: Forest Plot Construction
+# ==============================================================================
+
+cat("\n>>> [5/5] Generating publication-ready forest plot...\n")
+
+p_forest <- ggplot(final_plot_df, aes(x = OR, y = Plot_ID)) +
+  
+  # Null reference line (OR = 1.0)
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray60") +
+  
+  # Horizontal 95% confidence intervals
+  geom_errorbarh(
+    data      = subset(final_plot_df, !is_header),
+    aes(xmin  = LCI, xmax = UCI),
+    linewidth = 0.7,
+    color     = "#2C3E50",
+    width     = 0.2
+  ) +
+  
+  # Point estimates (adjusted odds ratios)
+  geom_point(
+    data  = subset(final_plot_df, !is_header),
+    color = "#D35400",
+    size  = 2.5,
+    shape = 15
+  ) +
+  
+  # Left text column: subgroup and stratum labels
+  geom_text(
+    aes(x        = 0.05,
+        label    = Level_Final,
+        fontface = ifelse(is_header, "bold", "plain")),
+    hjust = 0,
+    size  = 3.5
+  ) +
+  
+  # Middle text column: OR (95% CI)
+  geom_text(
+    aes(x = 18, label = Stats_Label),
+    hjust = 0,
+    size  = 3.2,
+    color = "black"
+  ) +
+  
+  # Right text column: FDR-corrected P-for-interaction
+  geom_text(
+    aes(x = 55, label = P_Int_Label),
+    hjust    = 0,
+    size     = 3.2,
+    fontface = "italic",
+    color    = "#2980B9"
+  ) +
+  
+  # Logarithmic x-axis (appropriate for odds ratio scale)
+  scale_x_log10(
+    breaks = c(0.5, 1, 2, 4, 8),
+    limits = c(0.05, 120)
+  ) +
+  
+  labs(
+    x = paste0("Multivariable-Adjusted Odds Ratio (95% CI): ",
+               risk_cut, " vs. Reference"),
+    y = ""
+  ) +
+  
+  theme_void() +
+  theme(
+    axis.line.x  = element_line(color = "black", linewidth = 0.5),
+    axis.text.x  = element_text(size = 9, color = "black",
+                                margin = margin(t = 5)),
+    axis.ticks.x = element_line(color = "black"),
+    axis.title.x = element_text(size = 10, face = "bold",
+                                margin = margin(t = 10), hjust = 0.35),
+    plot.margin  = margin(20, 20, 20, 20)
+  )
+
+# ==============================================================================
+# SECTION 9: Save Output
+# ==============================================================================
+
+if (!dir.exists(OUTPUT_DIR)) dir.create(OUTPUT_DIR, recursive = TRUE)
+
+output_path <- file.path(OUTPUT_DIR, PLOT_FILE)
+
+ggsave(
+  filename = output_path,
+  plot     = p_forest,
+  width    = PLOT_WIDTH,
+  height   = PLOT_HEIGHT,
+  device   = "pdf"
+)
+
+cat("\n[Done] Forest plot saved to:", output_path, "\n")
+
+# Render in active graphics device for interactive inspection
+print(p_forest)
