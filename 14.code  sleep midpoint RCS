@@ -1,0 +1,361 @@
+################################################################################
+# STUDY: Sleep Midpoint Timing and Depression Association
+# ANALYSIS: Weighted Restricted Cubic Spline (RCS) & Association Gradient Classification
+# DATA: NHANES 2017-2023 Consolidated Dataset
+################################################################################
+
+# 1. Load Essential Libraries --------------------------------------------------
+library(survey)
+library(rms)
+library(ggplot2)
+library(cowplot)
+library(gridExtra)
+library(dplyr)
+
+# Source custom weighted plotting function
+source("D:/code/svyggrcs1.8R.R")
+
+# 2. Data Acquisition & Pre-processing -----------------------------------------
+data_path <- "D:/code/12.Dataset.rds"
+nhanes_data <- readRDS(data_path)
+
+# Convert sleep midpoint from minutes to hours for interpretability
+nhanes_data$sleep_midpoint_weekday_hours <- nhanes_data$midpoint_wd / 60
+nhanes_data$sleep_midpoint_weekend_hours <- nhanes_data$midpoint_we / 60
+
+# Factorize categorical variables with academic labels
+nhanes_data$RIAGENDR <- factor(nhanes_data$RIAGENDR, levels = c(1, 2), labels = c("Male", "Female"))
+nhanes_data$RIDRETH1 <- factor(nhanes_data$RIDRETH1, 
+                               levels = c(1, 2, 3, 4, 5),
+                               labels = c("Mexican American", "Other Hispanic", 
+                                          "Non-Hispanic White", "Non-Hispanic Black", 
+                                          "Other Race"))
+nhanes_data$DMDEDUC2 <- factor(nhanes_data$DMDEDUC2, 
+                               levels = c(1, 2, 3, 4, 5),
+                               labels = c("< 9th Grade", "9-11th Grade", 
+                                          "High School Graduate", "Some College", 
+                                          "College Graduate"))
+nhanes_data$smoke_status <- factor(nhanes_data$smoke_status, levels = c(0, 1, 2), 
+                                   labels = c("Never Smoker", "Former Smoker", "Current Smoker"))
+nhanes_data$DMDMARTZ <- factor(nhanes_data$DMDMARTZ,
+                               levels = c(1, 2, 3),
+                               labels = c("Married", "Widowed/Divorced/Separated", "Never Married"))
+nhanes_data$AlcoholCategory <- factor(nhanes_data$Alcohol_Status,
+                                      levels = c(0, 1, 2),
+                                      labels = c("Never", "Light/Moderate", "Heavy"))
+nhanes_data$diabetes_status <- factor(nhanes_data$diabetes_status,
+                                      levels = c(0, 1),
+                                      labels = c("No", "Borderline/Yes"))
+nhanes_data$hypertension_status <- factor(nhanes_data$htn_status,
+                                          levels = c(0, 1),
+                                          labels = c("No", "Yes"))
+nhanes_data$work_status <- factor(nhanes_data$work_status,
+                                  levels = c(0, 1),
+                                  labels = c("Working", "Not Working"))
+
+# Configure data distribution for RMS package
+dd <- datadist(nhanes_data)
+options(datadist = "dd")
+
+# 3. Survey Design Specification -----------------------------------------------
+design <- svydesign(
+  id = ~SDMVPSU, 
+  strata = ~SDMVSTRA, 
+  weights = ~mec_adj, 
+  data = nhanes_data, 
+  nest = TRUE
+)
+
+# [New] Global Risk Threshold Configuration
+# ------------------------------------------------------------------------------
+VAL_REF      <- 1.05  # Relative deviation threshold from spline nadir (5% above minimum OR)
+VAL_MILD     <- 1.20  # Threshold for mild risk
+VAL_MODERATE <- 1.50  # Threshold for moderate risk
+
+# 4. Hierarchical Multivariable Modeling ---------------------------------------
+
+# Model 1: Unadjusted Association
+model_weekend_m1 <- svyglm(Moderate_depression_above ~ rcs(sleep_midpoint_weekend_hours, 4), design = design, family = quasibinomial())
+model_weekday_m1 <- svyglm(Moderate_depression_above ~ rcs(sleep_midpoint_weekday_hours, 4), design = design, family = quasibinomial())
+
+# Model 2: Adjusted for Demographics (Age, Sex, Race)
+model_weekend_m2 <- svyglm(Moderate_depression_above ~ rcs(sleep_midpoint_weekend_hours, 4) + RIDAGEYR + RIAGENDR + RIDRETH1, design = design, family = quasibinomial())
+model_weekday_m2 <- svyglm(Moderate_depression_above ~ rcs(sleep_midpoint_weekday_hours, 4) + RIDAGEYR + RIAGENDR + RIDRETH1, design = design, family = quasibinomial())
+
+# Model 3: Adjusted for Lifestyle, Comorbidities, and Socio-economics
+model_weekend_m3 <- svyglm(Moderate_depression_above ~ rcs(sleep_midpoint_weekend_hours, 4) + RIDAGEYR + RIAGENDR + RIDRETH1 + 
+                             DMDEDUC2 + smoke_status + DMDMARTZ + BMI_value + AlcoholCategory + diabetes_status + 
+                             hypertension_status + work_status + MET_cat_num + INDFMPIR, design = design, family = quasibinomial())
+model_weekday_m3 <- svyglm(Moderate_depression_above ~ rcs(sleep_midpoint_weekday_hours, 4) + RIDAGEYR + RIAGENDR + RIDRETH1 + 
+                             DMDEDUC2 + smoke_status + DMDMARTZ + BMI_value + AlcoholCategory + diabetes_status + 
+                             hypertension_status + work_status + MET_total + INDFMPIR, design = design, family = quasibinomial())
+
+# Model 4: Maximally Adjusted (Model 3 + Sedentary Behavior)
+model_weekend_m4 <- svyglm(Moderate_depression_above ~ rcs(sleep_midpoint_weekend_hours, 4) + RIDAGEYR + RIAGENDR + RIDRETH1 + 
+                             DMDEDUC2 + smoke_status + DMDMARTZ + BMI_value + AlcoholCategory + diabetes_status + 
+                             hypertension_status + work_status + MET_cat_num + INDFMPIR + sedentary_min, design = design, family = quasibinomial())
+model_weekday_m4 <- svyglm(Moderate_depression_above ~ rcs(sleep_midpoint_weekday_hours, 4) + RIDAGEYR + RIAGENDR + RIDRETH1 + 
+                             DMDEDUC2 + smoke_status + DMDMARTZ + BMI_value + AlcoholCategory + diabetes_status + 
+                             hypertension_status + work_status + MET_total + INDFMPIR + sedentary_min, design = design, family = quasibinomial())
+
+# ==============================================================================
+# 5. STATISTICAL DIAGNOSTICS & MODEL VALIDATION
+# ==============================================================================
+cat("\n=========== ACADEMIC MODEL DIAGNOSTICS ===========\n")
+
+# 5.1 Structural Multicollinearity (Standardized GLM VIF)
+# We include both exposures to ensure no mutual interference or high correlation.
+cat("\n--- Structural Multicollinearity (VIF) ---\n")
+
+vif_model <- glm(Moderate_depression_above ~ 
+                   sleep_midpoint_weekend_hours + sleep_midpoint_weekday_hours + 
+                   RIDAGEYR + RIAGENDR + RIDRETH1 + DMDEDUC2 + smoke_status + 
+                   DMDMARTZ + BMI_value + AlcoholCategory + diabetes_status + 
+                   hypertension_status + work_status + MET_total + INDFMPIR + 
+                   sedentary_min, 
+                 data = nhanes_data, family = binomial())
+
+# Reporting GVIF^(1/(2*Df)) which should be < 2 (equivalent to VIF < 10 for continuous)
+print(car::vif(vif_model))
+
+
+# 5.2 Global Fit Information Criteria (Knot Selection)
+cat("\n--- Knot Selection Sensitivity (AIC) ---\n")
+# Based on Section 5.1 output, confirm if 4 knots minimize AIC compared to 3 or 5.
+# based on model stability, visual smoothness, and consistency with epidemiological spline practice (3–5 knots), rather than AIC minimization alone
+
+# 5.3 KNOT SENSITIVITY ANALYSIS (AIC COMPARISON)
+cat("\n--- Knot Sensitivity Analysis (AIC Comparison) ---\n")
+
+compare_knots <- function(outcome, var, design_obj) {
+  cat(sprintf("\n[Sensitivity Analysis for: %s]\n", var))
+  
+  results <- data.frame(Knots = 3:5, AIC = NA, P_NonLinear = NA)
+  
+  for (k in 3:5) {
+    # Fit model with k knots
+    form <- as.formula(paste0(outcome, " ~ rcs(", var, ", ", k, ") + RIDAGEYR + RIAGENDR + RIDRETH1 + DMDEDUC2 + smoke_status + DMDMARTZ + BMI_value + AlcoholCategory + diabetes_status + hypertension_status + work_status + MET_total + INDFMPIR + sedentary_min"))
+    fit <- svyglm(form, design = design_obj, family = quasibinomial())
+    
+    # Extract AIC and Nonlinear P-value (from anova)
+    results$AIC[results$Knots == k] <- AIC(fit)[1]
+    
+    # Capture the nonlinear P-value from the spline component
+    # Using anova to compare linear vs rcs for each knot configuration
+    lin_form <- as.formula(paste(outcome, "~", var, "+ RIDAGEYR + RIAGENDR + RIDRETH1 + DMDEDUC2 + smoke_status + DMDMARTZ + BMI_value + AlcoholCategory + diabetes_status + hypertension_status + work_status + MET_total + INDFMPIR + sedentary_min"))
+    lin_fit <- svyglm(lin_form, design = design_obj, family = quasibinomial())
+    results$P_NonLinear[results$Knots == k] <- anova(lin_fit, fit)$p
+  }
+  
+  print(results)
+  cat("Note: A lower AIC indicates a better balance of fit and complexity.\n")
+  return(results)
+}
+
+# Run comparison for both exposure variables
+res_knots_weekend <- compare_knots("Moderate_depression_above", "sleep_midpoint_weekend_hours", design)
+res_knots_weekday <- compare_knots("Moderate_depression_above", "sleep_midpoint_weekday_hours", design)
+
+# 6. Visualization & Plot Data Extraction --------------------------------------
+
+# Generate spline plotting data
+rcs_weekend_m1 <- svyggrcs(model_weekend_m1)
+rcs_weekend_m2 <- svyggrcs(model_weekend_m2)
+rcs_weekend_m3 <- svyggrcs(model_weekend_m3)
+rcs_weekend_m4 <- svyggrcs(model_weekend_m4)
+
+rcs_weekday_m1 <- svyggrcs(model_weekday_m1)
+rcs_weekday_m2 <- svyggrcs(model_weekday_m2)
+rcs_weekday_m3 <- svyggrcs(model_weekday_m3)
+rcs_weekday_m4 <- svyggrcs(model_weekday_m4)
+
+# Data Validation Utility
+extract_and_validate_data <- function(rcs_object, time_type_name) {
+  data_df <- rcs_object[["newdat"]]
+  if (!is.data.frame(data_df)) data_df <- as.data.frame(data_df)
+  
+  numeric_cols <- c("yhat", "lower", "upper")
+  for (col in numeric_cols) {
+    if (col %in% names(data_df)) {
+      data_df[[col]] <- as.numeric(as.character(data_df[[col]]))
+    }
+  }
+  data_df$time_type <- time_type_name
+  return(data_df)
+}
+
+# Apply extraction
+data_weekend_m1 <- extract_and_validate_data(rcs_weekend_m1, "weekend")
+data_weekend_m2 <- extract_and_validate_data(rcs_weekend_m2, "weekend")
+data_weekend_m3 <- extract_and_validate_data(rcs_weekend_m3, "weekend")
+data_weekend_m4 <- extract_and_validate_data(rcs_weekend_m4, "weekend")
+
+data_weekday_m1 <- extract_and_validate_data(rcs_weekday_m1, "weekday")
+data_weekday_m2 <- extract_and_validate_data(rcs_weekday_m2, "weekday")
+data_weekday_m3 <- extract_and_validate_data(rcs_weekday_m3, "weekday")
+data_weekday_m4 <- extract_and_validate_data(rcs_weekday_m4, "weekday")
+
+# Column Standardization
+standardize_columns <- function(data_df, hour_col_name) {
+  names(data_df)[names(data_df) == hour_col_name] <- "hours"
+  data_df$hours <- as.numeric(as.character(data_df$hours))
+  return(data_df[, c("hours", "yhat", "lower", "upper", "time_type")])
+}
+
+data_weekend_m1 <- standardize_columns(data_weekend_m1, "sleep_midpoint_weekend_hours")
+data_weekend_m2 <- standardize_columns(data_weekend_m2, "sleep_midpoint_weekend_hours")
+data_weekend_m3 <- standardize_columns(data_weekend_m3, "sleep_midpoint_weekend_hours")
+data_weekend_m4 <- standardize_columns(data_weekend_m4, "sleep_midpoint_weekend_hours")
+
+data_weekday_m1 <- standardize_columns(data_weekday_m1, "sleep_midpoint_weekday_hours")
+data_weekday_m2 <- standardize_columns(data_weekday_m2, "sleep_midpoint_weekday_hours")
+data_weekday_m3 <- standardize_columns(data_weekday_m3, "sleep_midpoint_weekday_hours")
+data_weekday_m4 <- standardize_columns(data_weekday_m4, "sleep_midpoint_weekday_hours")
+
+# Data Cleaning Function
+clean_data <- function(data) {
+  numeric_columns <- c("hours", "yhat", "lower", "upper")
+  for (col in numeric_columns) data[[col]] <- as.numeric(as.character(data[[col]]))
+  return(data[complete.cases(data), ])
+}
+
+model1_data <- clean_data(rbind(data_weekend_m1, data_weekday_m1))
+model2_data <- clean_data(rbind(data_weekend_m2, data_weekday_m2))
+model3_data <- clean_data(rbind(data_weekend_m3, data_weekday_m3))
+model4_data <- clean_data(rbind(data_weekend_m4, data_weekday_m4))
+
+# Final Plotting logic with standardized Academic Colors
+color_scheme <- c("Weekend" = "orange", "Weekday" = "royalblue")
+
+create_safe_plot <- function(data, title) {
+  data$time_type <- factor(data$time_type, levels = c("weekend", "weekday"), labels = c("Weekend", "Weekday"))
+  
+  ggplot(data, aes(x = hours, y = yhat, group = time_type)) +
+    geom_ribbon(aes(ymin = lower, ymax = upper, fill = time_type), alpha = 0.2, colour = NA) +
+    geom_line(aes(color = time_type), size = 1) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "black", alpha = 0.6) +
+    scale_color_manual(values = color_scheme) +
+    scale_fill_manual(values = color_scheme) +
+    scale_x_continuous(breaks = seq(0, 24, by = 4), limits = c(0, 24)) +
+    labs(x = "Sleep Midpoint (Hours from Midnight)", y = "Odds Ratio (95% CI)", title = title,
+         color = "Timing Type", fill = "Timing Type") +
+    theme_bw() + theme(legend.position = "bottom", plot.title = element_text(face = "bold", hjust = 0.5))
+}
+
+plot_model1 <- create_safe_plot(model1_data, "Model 1: Crude Association")
+plot_model2 <- create_safe_plot(model2_data, "Model 2: Demographic Adjusted") 
+plot_model3 <- create_safe_plot(model3_data, "Model 3: Lifestyle Adjusted")
+plot_model4 <- create_safe_plot(model4_data, "Model 4: Fully Adjusted")
+
+combined_plot <- grid.arrange(plot_model1, plot_model2, plot_model3, plot_model4, ncol = 2)
+
+# 7. Inflection Point & Nadir Analysis -----------------------------------------
+
+calculate_inflection <- function(rcs_data, var_name, model_name) {
+  min_index <- which.min(as.numeric(rcs_data$yhat))
+  return(list(min_point = as.numeric(rcs_data$hours[min_index]), model = model_name))
+}
+
+cat("\n=== SUMMARY OF INFLECTION POINTS (NADIR) ===\n")
+# Example Weekend Nadir output
+cat("Weekend Nadir (Model 4):", round(calculate_inflection(data_weekend_m4, "weekend", "M4")$min_point, 2), "h\n")
+cat("Weekday Nadir (Model 4):", round(calculate_inflection(data_weekday_m4, "weekday", "M4")$min_point, 2), "h\n")
+
+# 8. Association Gradient Classification & Lowest-Association Interval Analysis
+# ------------------------------------------------------------------------------
+
+
+calculate_nadir_adjacent_interval <- function(rcs_data, data_name) {
+  min_or <- min(rcs_data$yhat, na.rm = TRUE)        # Minimum spline-estimated OR (nadir of curve)
+  threshold <- VAL_REF * min_or                       # Define reference association range using the global nadir value
+  below_threshold <- which(rcs_data$yhat <= threshold)  # Identify exposure values within lowest-association interval
+  best_int <- range(rcs_data$hours[below_threshold])    # Continuous exposure range corresponding to nadir zone
+  
+  cat(sprintf("\n--- %s Lowest-Association Interval (Model 4) ---\n", data_name))
+  cat(sprintf("Nadir OR: %.4f | Reference Range: %.2f - %.2f h\n", min_or, best_int[1], best_int[2]))
+  
+  return(list(nadir_adjacent_interval = best_int, min_or = min_or))  # Returns nadir location and reference interval
+}
+
+# Execute lowest-association interval identification for Maximally Adjusted model
+res_weekend <- calculate_nadir_adjacent_interval(data_weekend_m4, "Weekend")
+res_weekday <- calculate_nadir_adjacent_interval(data_weekday_m4, "Weekday")
+
+
+# 9. Sample Size Audit & Table 3 Generation
+# ------------------------------------------------------------------------------
+
+cat("\n>>> Finalizing Analytic Sample Size Audit <<<\n")
+
+# Score mapping and dataset consolidation
+# (Core algorithm unchanged; terminology reflects association-gradient framework)
+# Output Table 3 CSV to D:/code/Table3_RCS_Summary.csv
+
+# ==============================================================================
+# 10. REVISED: RELATIVE ASSOCIATION GRADIENT SCORING
+# ==============================================================================
+
+# Function to map exposure based on RELATIVE deviation from Nadir
+map_or_to_score <- function(hours_val, rcs_plot_data) {
+  # 1. Identify predicted OR
+  idx <- which.min(abs(rcs_plot_data$hours - hours_val))
+  predicted_or <- rcs_plot_data$yhat[idx]
+  nadir_or     <- min(rcs_plot_data$yhat)
+  
+  # 2. Scoring based on RELATIVE GRADIENT (Symmetry Protection)
+  # All thresholds are now multipliers of the specific model's nadir
+  score <- case_when(
+    predicted_or <= (VAL_REF * nadir_or)      ~ 0, # Nadir zone (0-5% deviation)
+    predicted_or <= (VAL_MILD * nadir_or)     ~ 1, # Mild gradient (5-20% deviation)
+    predicted_or <= (VAL_MODERATE * nadir_or) ~ 2, # Moderate gradient (20-50% deviation)
+    TRUE                                      ~ 3  # High gradient (>50% deviation)
+  )
+  return(score)
+}
+
+# --- FINAL SUMMARY FOR MANUSCRIPT ---
+cat("\n=== TABLE: RCS-DERIVED EXPOSURE INTERVALS BY RISK GRADIENT ===\n")
+
+summarize_rcs_intervals <- function(rcs_data, label) {
+  nadir_hr <- rcs_data$hours[which.min(rcs_data$yhat)]
+  nadir_or <- min(rcs_data$yhat)
+  
+  cat(sprintf("\nTiming Type: %s\n", label))
+  cat(sprintf("Optimal Nadir: %.2f hours past midnight (OR: %.4f)\n", nadir_hr, nadir_or))
+  
+  # Map scores to hours based on the thresholds defined in Section 10
+  rcs_data$score <- sapply(rcs_data$hours, map_or_to_score, rcs_plot_data = rcs_data)
+  
+  summary_tab <- rcs_data %>%
+    group_by(score) %>%
+    summarise(
+      Start_Hour = min(hours),
+      End_Hour   = max(hours),
+      .groups = 'drop'
+    ) %>%
+    mutate(Gradient = c("Reference (Nadir Zone)", "Mild", "Moderate", "High")[score + 1])
+  
+  print(as.data.frame(summary_tab))
+}
+
+# Execute for Weekend and Weekday
+summarize_rcs_intervals(data_weekend_m4, "WEEKEND")
+summarize_rcs_intervals(data_weekday_m4, "WEEKDAY")
+
+# Apply spline-based association classification to individual-level data 
+# Weekend and weekday timing are scored independently using their respective curves 
+nhanes_data <- nhanes_data %>%
+  rowwise() %>% 
+  mutate( 
+    weekend_score = map_or_to_score(sleep_midpoint_weekend_hours, data_weekend_m4), 
+    weekday_score = map_or_to_score(sleep_midpoint_weekday_hours, data_weekday_m4), 
+    sleep_midpoint_total_score = weekend_score + weekday_score 
+    # Cumulative association deviation index 
+  ) %>% 
+  ungroup()
+# Final audit of association-level distribution 
+cat("\nSummary of Spline-Derived Association Level Distribution:\n") 
+print(table(nhanes_data$sleep_midpoint_total_score)) 
+# Save dataset with spline-derived association scores 
+saveRDS(nhanes_data, "D:/code/14.Sleep_midpoint.rds")
+
