@@ -1,0 +1,99 @@
+################################################################################
+# Script Name: 2. PHQ-9 Depression Data Processing (NHANES 2017-2023)
+# Purpose: Extract, clean, recode PHQ-9 items, and calculate clinical scores.
+#          Includes binary classifications for Moderate (10+) and 
+#          Moderately Severe (15+) thresholds.
+# Data Cycles: 2017-2020 (P_DPQ) and 2021-2023 (DPQ_L)
+# Output: Cleaned Depression Dataset (2.data.rds)
+################################################################################
+
+# 1. Load Libraries ------------------------------------------------------------
+library(nhanesA)
+library(tidyverse)
+
+# 2. Setup Environment ---------------------------------------------------------
+export_dir <- "D:/code"
+if (!dir.exists(export_dir)) dir.create(export_dir, recursive = TRUE)
+
+# 3. Define Recoding Function --------------------------------------------------
+# Mapping NHANES raw codes (1-4) to Standard PHQ-9 scoring (0-3)
+# Note: NHANES codes 7 (Refused) and 9 (Don't Know) are mapped to NA
+recode_phq <- function(x) {
+  case_when(
+    x == 1 ~ 0,  # Not at all
+    x == 2 ~ 1,  # Several days
+    x == 3 ~ 2,  # More than half the days
+    x == 4 ~ 3,  # Nearly every day
+    TRUE ~ NA_real_ 
+  )
+}
+
+# 4. Process Data Cycles -------------------------------------------------------
+
+process_phq_cycle <- function(table_name, cycle_label) {
+  cat("Processing Cycle:", cycle_label, "...\n")
+  
+  # Retrieve raw data from NHANES
+  raw_data <- nhanes(table_name)
+  
+  processed <- raw_data %>%
+    select(SEQN, starts_with("DPQ")) %>%
+    # Filter to core 9 diagnostic items (DPQ010 through DPQ090)
+    select(SEQN, DPQ010:DPQ090) %>%
+    # Apply standard scoring transformation
+    mutate(across(DPQ010:DPQ090, ~recode_phq(as.numeric(.)))) %>%
+    # Calculate Total PHQ-9 Score
+    # Requirement: Complete responses for all 9 items (Strict Validation)
+    mutate(
+      PHQ9_SCORE = rowSums(select(., DPQ010:DPQ090)),
+      PHQ9_SCORE = ifelse(rowSums(is.na(select(., DPQ010:DPQ090))) == 0, PHQ9_SCORE, NA)
+    ) %>%
+    # Clinical Categorization and Binary Indicators
+    
+    mutate(
+      # Binary Indicator: Moderate Depression or higher (Score >= 10)
+      Moderate_depression_above = case_when(
+        PHQ9_SCORE >= 10 ~ 1,
+        PHQ9_SCORE < 10  ~ 0,
+        TRUE ~ NA_real_
+      ),
+      
+      # Binary Indicator: Moderately Severe Depression or higher (Score >= 15)
+      ModSevere_depression_above = case_when(
+        PHQ9_SCORE >= 15 ~ 1,
+        PHQ9_SCORE < 15  ~ 0,
+        TRUE ~ NA_real_
+      ),
+      
+      # Multi-level Severity Classification
+      PHQ9_Category_Num = case_when(
+        PHQ9_SCORE >= 20 ~ 5, # Severe
+        PHQ9_SCORE >= 15 ~ 4, # Moderately severe
+        PHQ9_SCORE >= 10 ~ 3, # Moderate
+        PHQ9_SCORE >= 5  ~ 2, # Mild
+        PHQ9_SCORE >= 1  ~ 1, # Minimal
+        PHQ9_SCORE == 0  ~ 0, # None
+        TRUE ~ NA_real_
+      ),
+      CYCLE = cycle_label
+    )
+  
+  return(processed)
+}
+
+# 5. Integration & Harmonization -----------------------------------------------
+phq_1720 <- process_phq_cycle("P_DPQ", "2017-2020")
+phq_2123 <- process_phq_cycle("DPQ_L", "2021-2023")
+
+phq_combined <- bind_rows(phq_1720, phq_2123)
+
+# 6. Quality Control & Export --------------------------------------------------
+cat("\n--- Descriptive Summary of PHQ-9 Scores ---\n")
+print(summary(phq_combined$PHQ9_SCORE))
+
+cat("\n--- Distribution of Binary Variable (Threshold >= 15) ---\n")
+print(table(phq_combined$ModSevere_depression_above, useNA = "always"))
+
+export_path <- file.path(export_dir, "2.data.rds")
+saveRDS(phq_combined, export_path)
+cat("\nProcess Complete. Dataset saved to:", export_path, "\n")
