@@ -1,0 +1,56 @@
+################################################################################
+# Script Name: 8. Covariate Processing - Hypertension Status (NHANES 2017-2023)
+# Purpose: Harmonize hypertension history using strict numeric code matching.
+# Definitions: 0: No (Code 2), 1: Yes (Code 1)
+# Output: Cleaned Hypertension Dataset (8.data.rds)
+################################################################################
+
+# 1. Environment & Libraries ---------------------------------------------------
+library(nhanesA)
+library(tidyverse)
+
+export_dir <- "D:/code"
+if (!dir.exists(export_dir)) dir.create(export_dir, recursive = TRUE)
+
+# 2. Data Retrieval & Processing Function --------------------------------------
+fetch_hypertension <- function(table_name, cycle_label) {
+  cat("Processing Cycle:", cycle_label, "...\n")
+  
+  # nhanes() by default might return factors; as.numeric() retrieves original codes
+  raw_data <- nhanes(table_name)
+  
+  processed <- raw_data %>%
+    select(SEQN, BPQ020) %>%
+    mutate(
+      # Ensure numeric type for consistent case_when matching
+      bp_code = as.numeric(BPQ020),
+      
+      # Standardizing Hypertension Status: 
+      # 1: Yes (Code 1)
+      # 0: No (Code 2)
+      # NA: Refused (7), Don't Know (9), or Missing (.)
+      htn_status = case_when(
+        bp_code == 1 ~ 1,
+        bp_code == 2 ~ 0,
+        TRUE ~ NA_real_
+      ),
+      CYCLE = cycle_label
+    ) %>%
+    select(SEQN, htn_status, CYCLE)
+  
+  return(processed)
+}
+
+# 3. Execution & Merging -------------------------------------------------------
+htn_1720 <- fetch_hypertension("P_BPQ", "2017-2020")
+htn_2123 <- fetch_hypertension("BPQ_L", "2021-2023")
+
+htn_combined <- bind_rows(htn_1720, htn_2123)
+
+# 4. Quality Control & Export --------------------------------------------------
+cat("\n--- Final Hypertension Status Distribution (Numeric-based) ---\n")
+print(table(htn_combined$htn_status, htn_combined$CYCLE, useNA = "always"))
+
+save_path <- file.path(export_dir, "8.data.rds")
+saveRDS(htn_combined, save_path)
+cat("\nHypertension data exported to:", save_path, "\n")
