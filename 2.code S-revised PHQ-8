@@ -1,0 +1,129 @@
+################################################################################
+# Script Name: 2. PHQ-8 Sensitivity Analysis Data Processing (NHANES 2017-2023)
+# Purpose: Extract, clean, and recode PHQ items; remove PHQ-9 item 3
+#          (sleep-related symptom, DPQ030); calculate PHQ-8 total scores; and
+#          create binary PHQ-8 outcomes for sensitivity analyses.
+# Data Cycles: 2017-2020 (P_DPQ) and 2021-2023 (DPQ_L)
+# Output: Cleaned Depression Dataset for Sensitivity Analysis (2.data_phq8.rds)
+################################################################################
+
+# 1. Load Libraries ------------------------------------------------------------
+library(nhanesA)
+library(tidyverse)
+
+# 2. Setup Environment ---------------------------------------------------------
+export_dir <- "D:/code"
+if (!dir.exists(export_dir)) dir.create(export_dir, recursive = TRUE)
+
+# 3. Define Recoding Function --------------------------------------------------
+# NHANES raw coding:
+#   1 = Not at all
+#   2 = Several days
+#   3 = More than half the days
+#   4 = Nearly every day
+# Standard PHQ item scoring:
+#   0, 1, 2, 3
+# NHANES codes 7 (Refused) and 9 (Don't know) are treated as missing.
+recode_phq <- function(x) {
+  case_when(
+    x == 1 ~ 0,
+    x == 2 ~ 1,
+    x == 3 ~ 2,
+    x == 4 ~ 3,
+    TRUE ~ NA_real_
+  )
+}
+
+# 4. Process Data Cycles -------------------------------------------------------
+process_phq8_cycle <- function(table_name, cycle_label) {
+  cat("Processing Cycle:", cycle_label, "...\n")
+  
+  raw_data <- nhanes(table_name)
+  
+  processed <- raw_data %>%
+    select(SEQN, starts_with("DPQ")) %>%
+    select(SEQN, DPQ010:DPQ090) %>%
+    
+    # Recode all PHQ items to standard 0-3 scoring
+    mutate(across(DPQ010:DPQ090, ~ recode_phq(as.numeric(.)))) %>%
+    
+    mutate(
+      # Original PHQ-9 total score (retained for reference and comparison)
+      PHQ9_SCORE = ifelse(
+        rowSums(is.na(select(., DPQ010:DPQ090))) == 0,
+        rowSums(select(., DPQ010:DPQ090)),
+        NA_real_
+      ),
+      
+      # DPQ030 corresponds to PHQ-9 item 3 (sleep-related symptom).
+      # PHQ-8 excludes this item for sensitivity analyses examining whether
+      # the main findings are robust to reduced overlap between the
+      # sleep-related exposure and the symptom-based outcome.
+      PHQ8_SCORE = ifelse(
+        rowSums(is.na(select(., DPQ010, DPQ020, DPQ040:DPQ090))) == 0,
+        rowSums(select(., DPQ010, DPQ020, DPQ040:DPQ090)),
+        NA_real_
+      ),
+      
+      # Main sensitivity-analysis outcome:
+      # PHQ-8 >= 10, chosen to maintain comparability with the primary
+      # PHQ-9 >= 10 definition used in the main analysis.
+      PHQ8_depression_above_10 = case_when(
+        PHQ8_SCORE >= 10 ~ 1,
+        PHQ8_SCORE < 10  ~ 0,
+        TRUE ~ NA_real_
+      ),
+      
+      # Additional sensitivity-analysis outcome:
+      # PHQ-8 >= 9, included as an alternative threshold for robustness checks.
+      PHQ8_depression_above_9 = case_when(
+        PHQ8_SCORE >= 9 ~ 1,
+        PHQ8_SCORE < 9  ~ 0,
+        TRUE ~ NA_real_
+      ),
+      
+      # Primary PHQ-9 binary outcomes retained for comparison only
+      PHQ9_depression_above_10 = case_when(
+        PHQ9_SCORE >= 10 ~ 1,
+        PHQ9_SCORE < 10  ~ 0,
+        TRUE ~ NA_real_
+      ),
+      
+      PHQ9_modsevere_above_15 = case_when(
+        PHQ9_SCORE >= 15 ~ 1,
+        PHQ9_SCORE < 15  ~ 0,
+        TRUE ~ NA_real_
+      ),
+      
+      CYCLE = cycle_label
+    )
+  
+  return(processed)
+}
+
+# 5. Integration & Harmonization -----------------------------------------------
+phq8_1720 <- process_phq8_cycle("P_DPQ", "2017-2020")
+phq8_2123 <- process_phq8_cycle("DPQ_L", "2021-2023")
+
+phq8_combined <- bind_rows(phq8_1720, phq8_2123)
+
+# 6. Quality Control & Export --------------------------------------------------
+cat("\n--- Descriptive Summary of PHQ-9 Scores ---\n")
+print(summary(phq8_combined$PHQ9_SCORE))
+
+cat("\n--- Descriptive Summary of PHQ-8 Scores (item 3 removed) ---\n")
+print(summary(phq8_combined$PHQ8_SCORE))
+
+cat("\n--- Distribution of Main Sensitivity Outcome (PHQ-8 >= 10) ---\n")
+print(table(phq8_combined$PHQ8_depression_above_10, useNA = "always"))
+
+cat("\n--- Distribution of Alternative Sensitivity Outcome (PHQ-8 >= 9) ---\n")
+print(table(phq8_combined$PHQ8_depression_above_9, useNA = "always"))
+
+cat("\n--- Distribution of Primary Outcome Reference (PHQ-9 >= 10) ---\n")
+print(table(phq8_combined$PHQ9_depression_above_10, useNA = "always"))
+
+export_path <- file.path(export_dir, "2.data_phq8.rds")
+saveRDS(phq8_combined, export_path)
+
+cat("\nProcess Complete. Dataset saved to:", export_path, "\n")
