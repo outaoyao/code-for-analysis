@@ -1,0 +1,777 @@
+################################################################################
+# STUDY: Multidimensional Circadian Misalignment and Depression
+# ANALYSIS: Independent Nonlinear Associations + Interaction Visualization
+# EXPOSURE: CMB_Score + Weekend Sleep Duration (dur_we)
+# COLOUR:   Panel b — pink/mauve (#CC79A7), CUD-safe
+################################################################################
+
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+
+library(survey)
+library(rms)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(car)
+library(metR)
+
+# ==============================================================================
+# 1. Import dataset
+# ==============================================================================
+
+nhanes_data <- readRDS("D:/code/18.Dataset.rds")
+
+# ==============================================================================
+# 2. Variable preparation
+# ==============================================================================
+
+nhanes_data <- nhanes_data %>%
+  mutate(
+    RIAGENDR            = factor(RIAGENDR),
+    RIDRETH1            = factor(RIDRETH1),
+    DMDEDUC2            = factor(DMDEDUC2),
+    smoke_status        = factor(smoke_status),
+    DMDMARTZ            = factor(DMDMARTZ),
+    AlcoholCategory     = factor(AlcoholCategory),
+    diabetes_status     = factor(diabetes_status),
+    hypertension_status = factor(hypertension_status),
+    work_status         = factor(work_status)
+  )
+
+factor_vars <- c("RIAGENDR", "RIDRETH1", "DMDEDUC2", "smoke_status",
+                 "DMDMARTZ", "AlcoholCategory",
+                 "diabetes_status", "hypertension_status", "work_status")
+
+# ==============================================================================
+# 3. Survey design
+# ==============================================================================
+
+options(survey.lonely.psu = "adjust")
+
+nhanes_design <- svydesign(
+  id      = ~SDMVPSU,
+  strata  = ~SDMVSTRA,
+  weights = ~mec_adj,
+  data    = nhanes_data,
+  nest    = TRUE
+)
+
+dd <- datadist(nhanes_data)
+options(datadist = "dd")
+
+# ==============================================================================
+# 4. Primary model: CMB_Score + dur_we (weekend sleep duration)
+# ==============================================================================
+
+fit_joint <- svyglm(
+  Moderate_depression_above ~
+    rcs(CMB_Score, 3) +
+    rcs(dur_we, 3) +           # weekend sleep duration
+    RIDAGEYR + RIAGENDR + RIDRETH1 + DMDEDUC2 +
+    smoke_status + DMDMARTZ + BMI_value + AlcoholCategory +
+    diabetes_status + hypertension_status + work_status +
+    MET_total + INDFMPIR + sedentary_min,
+  design = nhanes_design,
+  family = quasibinomial()
+)
+
+cat("\n--- Primary model summary ---\n")
+summary(fit_joint)
+
+# ==============================================================================
+# 5. Overall association tests (Wald)
+# ==============================================================================
+
+cat("\n--- Overall Association Tests (Wald) ---\n")
+regTermTest(fit_joint, ~ rcs(CMB_Score, 3))
+regTermTest(fit_joint, ~ rcs(dur_we, 3))
+
+# ==============================================================================
+# 6. Nonlinearity tests
+# ==============================================================================
+
+cat("\n--- Nonlinearity Tests ---\n")
+
+fit_cmb_linear <- svyglm(
+  Moderate_depression_above ~
+    CMB_Score +
+    rcs(dur_we, 3) +
+    RIDAGEYR + RIAGENDR + RIDRETH1 + DMDEDUC2 +
+    smoke_status + DMDMARTZ + BMI_value + AlcoholCategory +
+    diabetes_status + hypertension_status + work_status +
+    MET_total + INDFMPIR + sedentary_min,
+  design = nhanes_design,
+  family = quasibinomial()
+)
+
+fit_sleep_linear <- svyglm(
+  Moderate_depression_above ~
+    rcs(CMB_Score, 3) +
+    dur_we +                   # weekend sleep duration (linear)
+    RIDAGEYR + RIAGENDR + RIDRETH1 + DMDEDUC2 +
+    smoke_status + DMDMARTZ + BMI_value + AlcoholCategory +
+    diabetes_status + hypertension_status + work_status +
+    MET_total + INDFMPIR + sedentary_min,
+  design = nhanes_design,
+  family = quasibinomial()
+)
+
+cat("\n  Nonlinearity test — CMB_Score:\n")
+anova_cmb   <- anova(fit_cmb_linear,  fit_joint)
+print(anova_cmb)
+
+cat("\n  Nonlinearity test — dur_we:\n")
+anova_sleep <- anova(fit_sleep_linear, fit_joint)
+print(anova_sleep)
+
+p_nonlinear_cmb   <- anova_cmb$p
+p_nonlinear_sleep <- anova_sleep$p
+
+# ==============================================================================
+# 7. Interaction test (CMB_Score × dur_we)
+# ==============================================================================
+
+cat("\n--- Interaction Test (CMB_Score × dur_we) ---\n")
+
+fit_interact <- svyglm(
+  Moderate_depression_above ~
+    rcs(CMB_Score, 3) +
+    rcs(dur_we, 3) +
+    CMB_Score : dur_we +
+    RIDAGEYR + RIAGENDR + RIDRETH1 + DMDEDUC2 +
+    smoke_status + DMDMARTZ + BMI_value + AlcoholCategory +
+    diabetes_status + hypertension_status + work_status +
+    MET_total + INDFMPIR + sedentary_min,
+  design = nhanes_design,
+  family = quasibinomial()
+)
+
+interact_test <- regTermTest(fit_interact, ~ CMB_Score : dur_we)
+p_interaction <- interact_test$p
+cat(sprintf("\n  P_interaction (CMB × weekend sleep) = %.4f\n", p_interaction))
+
+p_nonlinear_cmb_label <- ifelse(
+  p_nonlinear_cmb < 0.001,
+  "P-nonlinear < 0.001",
+  sprintf("P-nonlinear = %.3f", p_nonlinear_cmb)
+)
+
+p_nonlinear_sleep_label <- ifelse(
+  p_nonlinear_sleep < 0.001,
+  "P-nonlinear < 0.001",
+  sprintf("P-nonlinear = %.3f", p_nonlinear_sleep)
+)
+
+p_interact_plain <- ifelse(
+  p_interaction < 0.001,
+  "P-interaction < 0.001",
+  sprintf("P-interaction = %.3f", p_interaction)
+)
+
+# ==============================================================================
+# 8. Marginal prediction — CMB_Score (Panel a)
+# ==============================================================================
+
+cmb_seq <- seq(
+  quantile(nhanes_data$CMB_Score, 0.01, na.rm = TRUE),
+  quantile(nhanes_data$CMB_Score, 0.99, na.rm = TRUE),
+  length.out = 200
+)
+
+newdata_cmb <- data.frame(
+  CMB_Score     = cmb_seq,
+  dur_we        = median(nhanes_data$dur_we,        na.rm = TRUE),
+  RIDAGEYR      = median(nhanes_data$RIDAGEYR,      na.rm = TRUE),
+  BMI_value     = median(nhanes_data$BMI_value,     na.rm = TRUE),
+  MET_total     = median(nhanes_data$MET_total,     na.rm = TRUE),
+  INDFMPIR      = median(nhanes_data$INDFMPIR,      na.rm = TRUE),
+  sedentary_min = median(nhanes_data$sedentary_min, na.rm = TRUE)
+)
+
+for (v in factor_vars) {
+  newdata_cmb[[v]] <- factor(levels(nhanes_data[[v]])[1],
+                             levels = levels(nhanes_data[[v]]))
+}
+
+beta_joint <- coef(fit_joint)
+Vcov_joint <- vcov(fit_joint)
+
+Xmat_cmb      <- model.matrix(delete.response(terms(fit_joint)), data = newdata_cmb)
+fit_cmb_pred  <- as.vector(Xmat_cmb %*% beta_joint)
+se_cmb        <- sqrt(diag(Xmat_cmb %*% Vcov_joint %*% t(Xmat_cmb)))
+
+ref_cmb       <- median(nhanes_data$CMB_Score, na.rm = TRUE)
+ref_idx_cmb   <- which.min(abs(newdata_cmb$CMB_Score - ref_cmb))
+ref_logit_cmb <- fit_cmb_pred[ref_idx_cmb]
+
+newdata_cmb$OR <- exp(fit_cmb_pred - ref_logit_cmb)
+newdata_cmb$LL <- exp(fit_cmb_pred - 1.96 * se_cmb - ref_logit_cmb)
+newdata_cmb$UL <- exp(fit_cmb_pred + 1.96 * se_cmb - ref_logit_cmb)
+
+cmb_nadir <- newdata_cmb$CMB_Score[which.min(newdata_cmb$OR)]
+cat(sprintf("\n  CMB nadir (min OR) = %.3f\n", cmb_nadir))
+
+# ==============================================================================
+# 9. Marginal prediction — dur_we (Panel b)
+# ==============================================================================
+
+sleep_seq <- seq(
+  quantile(nhanes_data$dur_we, 0.01, na.rm = TRUE),
+  quantile(nhanes_data$dur_we, 0.99, na.rm = TRUE),
+  length.out = 200
+)
+
+newdata_sleep <- data.frame(
+  dur_we        = sleep_seq,
+  CMB_Score     = median(nhanes_data$CMB_Score,     na.rm = TRUE),
+  RIDAGEYR      = median(nhanes_data$RIDAGEYR,      na.rm = TRUE),
+  BMI_value     = median(nhanes_data$BMI_value,     na.rm = TRUE),
+  MET_total     = median(nhanes_data$MET_total,     na.rm = TRUE),
+  INDFMPIR      = median(nhanes_data$INDFMPIR,      na.rm = TRUE),
+  sedentary_min = median(nhanes_data$sedentary_min, na.rm = TRUE)
+)
+
+for (v in factor_vars) {
+  newdata_sleep[[v]] <- factor(levels(nhanes_data[[v]])[1],
+                               levels = levels(nhanes_data[[v]]))
+}
+
+Xmat_sleep      <- model.matrix(delete.response(terms(fit_joint)), data = newdata_sleep)
+fit_sleep_pred  <- as.vector(Xmat_sleep %*% beta_joint)
+se_sleep        <- sqrt(diag(Xmat_sleep %*% Vcov_joint %*% t(Xmat_sleep)))
+
+ref_sleep       <- median(nhanes_data$dur_we, na.rm = TRUE)
+ref_idx_sleep   <- which.min(abs(newdata_sleep$dur_we - ref_sleep))
+ref_logit_sleep <- fit_sleep_pred[ref_idx_sleep]
+
+newdata_sleep$OR <- exp(fit_sleep_pred - ref_logit_sleep)
+newdata_sleep$LL <- exp(fit_sleep_pred - 1.96 * se_sleep - ref_logit_sleep)
+newdata_sleep$UL <- exp(fit_sleep_pred + 1.96 * se_sleep - ref_logit_sleep)
+
+sleep_nadir <- newdata_sleep$dur_we[which.min(newdata_sleep$OR)]
+cat(sprintf("  Weekend sleep nadir (min OR) = %.3f hours\n", sleep_nadir))
+
+# ==============================================================================
+# 10. Joint prediction grid for heatmap (Panel c)
+# ==============================================================================
+
+cmb_grid   <- seq(quantile(nhanes_data$CMB_Score, 0.05, na.rm = TRUE),
+                  quantile(nhanes_data$CMB_Score, 0.95, na.rm = TRUE),
+                  length.out = 60)
+
+sleep_grid <- seq(quantile(nhanes_data$dur_we, 0.05, na.rm = TRUE),
+                  quantile(nhanes_data$dur_we, 0.95, na.rm = TRUE),
+                  length.out = 60)
+
+grid_df <- expand.grid(CMB_Score = cmb_grid, dur_we = sleep_grid)
+
+grid_df$RIDAGEYR      <- median(nhanes_data$RIDAGEYR,      na.rm = TRUE)
+grid_df$BMI_value     <- median(nhanes_data$BMI_value,     na.rm = TRUE)
+grid_df$MET_total     <- median(nhanes_data$MET_total,     na.rm = TRUE)
+grid_df$INDFMPIR      <- median(nhanes_data$INDFMPIR,      na.rm = TRUE)
+grid_df$sedentary_min <- median(nhanes_data$sedentary_min, na.rm = TRUE)
+
+for (v in factor_vars) {
+  grid_df[[v]] <- factor(levels(nhanes_data[[v]])[1],
+                         levels = levels(nhanes_data[[v]]))
+}
+
+Xmat_grid <- model.matrix(delete.response(terms(fit_joint)), data = grid_df)
+fit_grid  <- as.vector(Xmat_grid %*% beta_joint)
+
+dist_mat     <- abs(grid_df$CMB_Score - median(nhanes_data$CMB_Score, na.rm = TRUE)) +
+  abs(grid_df$dur_we    - median(nhanes_data$dur_we,    na.rm = TRUE))
+ref_grid_row <- which.min(dist_mat)
+
+ref_logit_grid <- fit_grid[ref_grid_row]
+grid_df$log_OR <- fit_grid - ref_logit_grid
+grid_df$OR     <- exp(grid_df$log_OR)
+
+max_abs <- quantile(abs(grid_df$log_OR), 0.97)
+clim    <- c(-max_abs, max_abs)
+
+cat(sprintf("  Grid OR range: [%.4f, %.4f]\n", min(grid_df$OR), max(grid_df$OR)))
+
+# ==============================================================================
+# 11. Build Panel a — CMB (blue, unchanged)
+# ==============================================================================
+
+p_A <- ggplot(newdata_cmb, aes(x = CMB_Score, y = OR)) +
+  geom_ribbon(aes(ymin = LL, ymax = UL),
+              fill = "#56B4E9", alpha = 0.30) +
+  geom_line(color = "#0072B2", linewidth = 1.2) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "grey40") +
+  geom_vline(xintercept = ref_cmb,
+             linetype = "dotted", color = "grey60", linewidth = 0.7) +
+  annotate("text",
+           x = Inf, y = Inf, hjust = 1.2, vjust = 1.8,
+           label = p_nonlinear_cmb_label,
+           fontface = "italic", size = 3.8, color = "grey20") +
+  coord_cartesian(
+    xlim = quantile(nhanes_data$CMB_Score, c(0.05, 0.95)),
+    ylim = c(0.4, 2.4)
+  ) +
+  scale_y_continuous(breaks = c(0.5, 1.0, 1.5, 2.0)) +
+  theme_classic(base_size = 13) +
+  theme(plot.title  = element_text(face = "bold", size = 12),
+        axis.title  = element_text(size = 11),
+        plot.margin = margin(8, 14, 8, 8)) +
+  labs(x     = "Circadian Misalignment",
+       y     = "Adjusted OR (95% CI)",
+       title = "a")
+
+# ==============================================================================
+# 12. Build Panel b — Weekend sleep duration (pink/mauve #CC79A7)
+# ==============================================================================
+
+p_B <- ggplot(newdata_sleep, aes(x = dur_we, y = OR)) +
+  geom_ribbon(aes(ymin = LL, ymax = UL),
+              fill = "#CC79A7", alpha = 0.30) +       # mauve ribbon
+  geom_line(color = "#CC79A7", linewidth = 1.2) +     # mauve line
+  geom_hline(yintercept = 1, linetype = "dashed", color = "grey40") +
+  geom_vline(xintercept = ref_sleep,
+             linetype = "dotted", color = "grey60", linewidth = 0.7) +
+  annotate("text",
+           x = Inf, y = Inf, hjust = 1.08, vjust = 1.8,
+           label = p_nonlinear_sleep_label,
+           fontface = "italic", size = 3.8, color = "grey20") +
+  coord_cartesian(
+    xlim = quantile(nhanes_data$dur_we, c(0.05, 0.95)),
+    ylim = c(0.4, 2.4)
+  ) +
+  scale_y_continuous(breaks = c(0.5, 1.0, 1.5, 2.0)) +
+  theme_classic(base_size = 13) +
+  theme(plot.title  = element_text(face = "bold", size = 12),
+        axis.title  = element_text(size = 11),
+        plot.margin = margin(8, 14, 8, 8)) +
+  labs(x     = "Weekend Sleep Duration (hours)",
+       y     = "Adjusted OR (95% CI)",
+       title = "b")
+
+# ==============================================================================
+# 13. Build Panel c — 2D heatmap with contour lines
+# ==============================================================================
+
+x_lo <- quantile(nhanes_data$CMB_Score, 0.05, na.rm = TRUE)
+x_hi <- quantile(nhanes_data$CMB_Score, 0.95, na.rm = TRUE)
+y_lo <- quantile(nhanes_data$dur_we,    0.05, na.rm = TRUE)
+y_hi <- quantile(nhanes_data$dur_we,    0.95, na.rm = TRUE)
+
+contour_breaks  <- c(1.00,     1.20,     1.50)
+contour_colours <- c("#FFFFFF", "#FFD700", "#CC0099")
+contour_ltypes  <- c("dashed",  "solid",   "solid")
+contour_lwd     <- c(1.1,       1.0,       1.0)
+contour_labels  <- c("OR=1.00", "OR=1.20", "OR=1.50")
+label_colours   <- c("grey15",  "#C8A800", "#CC0099")
+
+find_label_pos <- function(target_or, grid, x_frac = 0.5, y_nudge = 0.12) {
+  x_range  <- range(grid$CMB_Score)
+  x_target <- x_range[1] + x_frac * diff(x_range)
+  x_vals   <- unique(grid$CMB_Score)
+  x_use    <- x_vals[which.min(abs(x_vals - x_target))]
+  sub      <- grid[abs(grid$CMB_Score - x_use) < 1e-6, ]
+  idx      <- which.min(abs(sub$OR - target_or))
+  list(x = sub$CMB_Score[idx],
+       y = sub$dur_we[idx] + y_nudge)     # dur_we column
+}
+
+lab_10 <- find_label_pos(1.00, grid_df, x_frac = 0.45, y_nudge =  0.18)
+lab_12 <- find_label_pos(1.20, grid_df, x_frac = 0.65, y_nudge =  0.22)
+lab_15 <- find_label_pos(1.50, grid_df, x_frac = 0.80, y_nudge =  0.28)
+
+p_C <- ggplot(grid_df, aes(x = CMB_Score, y = dur_we)) +   # y = dur_we
+  
+  geom_tile(aes(fill = log_OR)) +
+  
+  geom_contour(aes(z = OR), breaks = 1.00,
+               color = contour_colours[1], linetype = contour_ltypes[1],
+               linewidth = contour_lwd[1]) +
+  geom_contour(aes(z = OR), breaks = 1.20,
+               color = contour_colours[2], linetype = contour_ltypes[2],
+               linewidth = contour_lwd[2]) +
+  geom_contour(aes(z = OR), breaks = 1.50,
+               color = contour_colours[3], linetype = contour_ltypes[3],
+               linewidth = contour_lwd[3]) +
+  
+  annotate("text", x = lab_10$x, y = lab_10$y, label = "OR=1.00",
+           color = label_colours[1], size = 2.8, fontface = "bold", hjust = 0.5) +
+  annotate("text", x = lab_12$x, y = lab_12$y, label = "OR=1.20",
+           color = label_colours[2], size = 2.8, fontface = "bold", hjust = 0.5) +
+  annotate("text", x = lab_15$x, y = lab_15$y, label = "OR=1.50",
+           color = label_colours[3], size = 2.8, fontface = "bold", hjust = 0.5) +
+  
+  geom_vline(xintercept = median(nhanes_data$CMB_Score, na.rm = TRUE),
+             linetype = "dashed", color = "white", linewidth = 0.75, alpha = 0.85) +
+  geom_hline(yintercept = median(nhanes_data$dur_we, na.rm = TRUE),
+             linetype = "dashed", color = "white", linewidth = 0.75, alpha = 0.85) +
+  
+  annotate("point",
+           x = median(nhanes_data$CMB_Score, na.rm = TRUE),
+           y = median(nhanes_data$dur_we,    na.rm = TRUE),
+           size = 2.8, shape = 21, fill = "white", color = "black") +
+  
+  annotate("segment",
+           x    = x_lo + 0.03 * (x_hi - x_lo),
+           xend = x_lo + 0.13 * (x_hi - x_lo),
+           y    = y_hi - (0.07 * (y_hi - y_lo)) * (1:3),
+           yend = y_hi - (0.07 * (y_hi - y_lo)) * (1:3),
+           color = contour_colours, linetype = contour_ltypes,
+           linewidth = 0.9) +
+  annotate("text",
+           x = x_lo + 0.15 * (x_hi - x_lo),
+           y = y_hi - (0.07 * (y_hi - y_lo)) * (1:3),
+           label = contour_labels, color = label_colours,
+           size = 2.5, hjust = 0, fontface = "bold") +
+  
+  scale_fill_gradientn(
+    colours = c("#053061", "#2166AC", "#92C5DE",
+                "#F7F7F7",
+                "#F1A340", "#E08214", "#7F3B08"),
+    limits  = clim,
+    name    = "log(OR)\nvs. median",
+    guide   = guide_colorbar(barheight = unit(5, "cm"),
+                             barwidth  = unit(0.5, "cm"),
+                             title.hjust = 0.5)
+  ) +
+  
+  coord_cartesian(xlim = c(x_lo, x_hi),
+                  ylim = c(y_lo, y_hi),
+                  clip = "on") +
+  
+  theme_classic(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold",   size = 12),
+    plot.subtitle = element_text(face = "italic", size = 11,
+                                 color = "black", hjust = 0.9,
+                                 margin = margin(t = 2, b = 6)),
+    axis.title    = element_text(size = 11),
+    legend.title  = element_text(size = 10, hjust = 0.5),
+    legend.text   = element_text(size = 9),
+    legend.position = "right",
+    plot.margin   = margin(8, 12, 8, 8)
+  ) +
+  labs(x        = "Circadian Misalignment",
+       y        = "Weekend Sleep Duration (hours)",
+       title    = "c",
+       subtitle = p_interact_plain)
+
+cat(sprintf("p_C built: %s\n", class(p_C)[1]))
+
+# ==============================================================================
+# 14. Combine and save
+# ==============================================================================
+
+p_interact_caption <- ifelse(
+  p_interaction < 0.001,
+  "P-interaction (circadian misalignment x weekend sleep duration) < 0.001",
+  sprintf("P-interaction (circadian misalignment x weekend sleep duration) = %.3f",
+          p_interaction)
+)
+
+combined_fig <- (p_A | p_B) / p_C +
+  plot_annotation(
+    caption = paste0(
+      "Reference: both exposures fixed at the population median ",
+      "(white crosshair, panel c). ",
+      "A nonlinear association was observed between circadian misalignment ",
+      "score and the likelihood of depressive symptoms (panel a). ",
+      "A lower prevalence of depressive symptoms was clustered around ",
+      sprintf("%.1f hours of weekend sleep duration (panel b). ", sleep_nadir),
+      "Panel c depicts the joint predicted log(OR) surface across the ",
+      "5th-95th percentile range of both exposures; ",
+      "contour lines indicate OR thresholds of 1.00 (white dashed), ",
+      "1.20 (gold solid), and 1.50 (magenta solid). ",
+      "Grey areas represent regions with insufficient data for stable estimation. ",
+      "All models adjusted for age, sex, race/ethnicity, education, ",
+      "marital status, BMI, smoking, alcohol use, diabetes, hypertension, ",
+      "employment, total MET-minutes, income-to-poverty ratio, and sedentary time. ",
+      p_interact_caption, "."
+    ),
+    theme = theme(
+      plot.caption = element_text(size = 8.2, hjust = 0,
+                                  color = "grey35",
+                                  margin = margin(t = 10))
+    )
+  )
+
+print(combined_fig)
+
+ggsave(filename = "D:/code/Figure_4D_weekend.png",
+       plot = combined_fig,
+       width = 14, height = 12, dpi = 300, bg = "white")
+
+cat("\n[Done] Figure saved to D:/code/Figure_4D_weekend.png\n")
+
+# ==============================================================================
+# 15. Nadir report
+# ==============================================================================
+
+cat("\n--- Nadir Points ---\n")
+cat(sprintf("  CMB_Score nadir        : %.3f\n",       cmb_nadir))
+cat(sprintf("  Weekend sleep nadir    : %.3f hours\n", sleep_nadir))
+cat(sprintf("  P_interaction          : %.4f\n",       p_interaction))
+cat(sprintf("  P_nonlinear (CMB)      : %.4f\n",       p_nonlinear_cmb))
+cat(sprintf("  P_nonlinear (dur_we)   : %.4f\n",       p_nonlinear_sleep))
+
+# ==============================================================================
+# 16. Final journal-ready export (append-only)
+#    Based on existing p_A / p_B / p_C objects
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 16.1 Output directory
+# ------------------------------------------------------------------------------
+
+output_dir <- "D:/code/photo"
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+# ------------------------------------------------------------------------------
+# 16.2 Standardized publication theme
+# ------------------------------------------------------------------------------
+
+theme_pub_final <- theme_classic(base_size = 18) +
+  theme(
+    plot.title      = element_text(size = 18, face = "bold", hjust = 0.02),
+    plot.subtitle   = element_text(size = 13, face = "plain", hjust = 0.98, color = "black"),
+    axis.title      = element_text(size = 16, face = "bold", color = "black"),
+    axis.text       = element_text(size = 13, color = "black"),
+    legend.title    = element_text(size = 12, face = "bold"),
+    legend.text     = element_text(size = 11, color = "black"),
+    strip.text      = element_text(size = 13, face = "bold"),
+    plot.margin     = margin(12, 12, 12, 12),
+    panel.border    = element_blank()
+  )
+
+# ------------------------------------------------------------------------------
+# 16.3 Standardized P-value wording
+# ------------------------------------------------------------------------------
+
+p_nonlinear_cmb_final <- ifelse(
+  p_nonlinear_cmb < 0.001,
+  "P for nonlinearity < 0.001",
+  sprintf("P for nonlinearity = %.3f", p_nonlinear_cmb)
+)
+
+p_nonlinear_sleep_final <- ifelse(
+  p_nonlinear_sleep < 0.001,
+  "P for nonlinearity < 0.001",
+  sprintf("P for nonlinearity = %.3f", p_nonlinear_sleep)
+)
+
+p_interaction_final <- ifelse(
+  p_interaction < 0.001,
+  "P for interaction < 0.001",
+  sprintf("P for interaction = %.3f", p_interaction)
+)
+
+# ------------------------------------------------------------------------------
+# 16.4 Rebuild Panel A (uppercase label, standardized annotation)
+# ------------------------------------------------------------------------------
+
+fig_A_final <- ggplot(newdata_cmb, aes(x = CMB_Score, y = OR)) +
+  geom_ribbon(aes(ymin = LL, ymax = UL),
+              fill = "#56B4E9", alpha = 0.28) +
+  geom_line(color = "#0072B2", linewidth = 1.25) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "grey40", linewidth = 0.7) +
+  geom_vline(xintercept = ref_cmb, linetype = "dotted", color = "grey60", linewidth = 0.7) +
+  annotate("text",
+           x = Inf, y = Inf,
+           hjust = 1.02, vjust = 1.3,
+           label = p_nonlinear_cmb_final,
+           size = 4.3, color = "grey20", fontface = "plain") +
+  coord_cartesian(
+    xlim = quantile(nhanes_data$CMB_Score, c(0.05, 0.95), na.rm = TRUE),
+    ylim = c(0.4, 2.5)
+  ) +
+  scale_y_continuous(breaks = c(0.5, 1.0, 1.5, 2.0)) +
+  labs(
+    title = "A",
+    x = "Cumulative Circadian Misalignment Score",
+    y = "Adjusted Odds Ratio (95% CI)"
+  ) +
+  theme_pub_final +
+  theme(legend.position = "none")
+
+# ------------------------------------------------------------------------------
+# 16.5 Rebuild Panel B (weekend sleep duration)
+# ------------------------------------------------------------------------------
+
+fig_B_final <- ggplot(newdata_sleep, aes(x = dur_we, y = OR)) +
+  geom_ribbon(aes(ymin = LL, ymax = UL),
+              fill = "#CC79A7", alpha = 0.30) +
+  geom_line(color = "#CC79A7", linewidth = 1.25) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "grey40", linewidth = 0.7) +
+  geom_vline(xintercept = ref_sleep, linetype = "dotted", color = "grey60", linewidth = 0.7) +
+  annotate("text",
+           x = Inf, y = Inf,
+           hjust = 1.02, vjust = 1.3,
+           label = p_nonlinear_sleep_final,
+           size = 4.3, color = "grey20", fontface = "plain") +
+  coord_cartesian(
+    xlim = quantile(nhanes_data$dur_we, c(0.05, 0.95), na.rm = TRUE),
+    ylim = c(0.4, 2.5)
+  ) +
+  scale_y_continuous(breaks = c(0.5, 1.0, 1.5, 2.0)) +
+  labs(
+    title = "B",
+    x = "Weekend Sleep Duration (hours)",
+    y = "Adjusted Odds Ratio (95% CI)"
+  ) +
+  theme_pub_final +
+  theme(legend.position = "none")
+
+# ------------------------------------------------------------------------------
+# 16.6 Rebuild Panel C (weekend joint heatmap)
+# ------------------------------------------------------------------------------
+
+fig_C_final <- ggplot(grid_df, aes(x = CMB_Score, y = dur_we)) +
+  geom_tile(aes(fill = log_OR)) +
+  geom_contour(aes(z = OR), breaks = 1.00,
+               color = contour_colours[1], linetype = contour_ltypes[1],
+               linewidth = contour_lwd[1]) +
+  geom_contour(aes(z = OR), breaks = 1.20,
+               color = contour_colours[2], linetype = contour_ltypes[2],
+               linewidth = contour_lwd[2]) +
+  geom_contour(aes(z = OR), breaks = 1.50,
+               color = contour_colours[3], linetype = contour_ltypes[3],
+               linewidth = contour_lwd[3]) +
+  annotate("text", x = lab_10$x, y = lab_10$y, label = "OR = 1.00",
+           color = label_colours[1], size = 3.5, fontface = "bold", hjust = 0.5) +
+  annotate("text", x = lab_12$x, y = lab_12$y, label = "OR = 1.20",
+           color = label_colours[2], size = 3.5, fontface = "bold", hjust = 0.5) +
+  annotate("text", x = lab_15$x, y = lab_15$y, label = "OR = 1.50",
+           color = label_colours[3], size = 3.5, fontface = "bold", hjust = 0.5) +
+  geom_vline(xintercept = median(nhanes_data$CMB_Score, na.rm = TRUE),
+             linetype = "dashed", color = "white", linewidth = 0.75, alpha = 0.85) +
+  geom_hline(yintercept = median(nhanes_data$dur_we, na.rm = TRUE),
+             linetype = "dashed", color = "white", linewidth = 0.75, alpha = 0.85) +
+  annotate("point",
+           x = median(nhanes_data$CMB_Score, na.rm = TRUE),
+           y = median(nhanes_data$dur_we, na.rm = TRUE),
+           size = 3.0, shape = 21, fill = "white", color = "black") +
+  annotate("text",
+           x = Inf, y = Inf,
+           hjust = 1.01, vjust = 1.2,
+           label = p_interaction_final,
+           size = 4.1, color = "black", fontface = "plain") +
+  scale_fill_gradientn(
+    colours = c("#053061", "#2166AC", "#92C5DE",
+                "#F7F7F7",
+                "#F1A340", "#E08214", "#7F3B08"),
+    limits = clim,
+    name = "log(OR)\nvs median",
+    guide = guide_colorbar(
+      barheight = unit(5, "cm"),
+      barwidth  = unit(0.55, "cm"),
+      title.hjust = 0.5
+    )
+  ) +
+  coord_cartesian(
+    xlim = c(x_lo, x_hi),
+    ylim = c(y_lo, y_hi),
+    clip = "on"
+  ) +
+  labs(
+    title = "C",
+    x = "Cumulative Circadian Misalignment Score",
+    y = "Weekend Sleep Duration (hours)"
+  ) +
+  theme_pub_final +
+  theme(legend.position = "right")
+
+# ------------------------------------------------------------------------------
+# 16.7 Print final panels
+# ------------------------------------------------------------------------------
+
+print(fig_A_final)
+print(fig_B_final)
+print(fig_C_final)
+
+# ------------------------------------------------------------------------------
+# 16.8 Export separate TIFF files
+# ------------------------------------------------------------------------------
+
+ggsave(
+  filename = file.path(output_dir, "Figure_Weekend_A.tiff"),
+  plot = fig_A_final,
+  device = "tiff",
+  width = 7.2,
+  height = 5.6,
+  units = "in",
+  dpi = 600,
+  compression = "lzw",
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(output_dir, "Figure_Weekend_B.tiff"),
+  plot = fig_B_final,
+  device = "tiff",
+  width = 7.2,
+  height = 5.6,
+  units = "in",
+  dpi = 600,
+  compression = "lzw",
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(output_dir, "Figure_Weekend_C.tiff"),
+  plot = fig_C_final,
+  device = "tiff",
+  width = 8.2,
+  height = 6.8,
+  units = "in",
+  dpi = 300,
+  compression = "lzw",
+  bg = "white"
+)
+
+cat("\n[Done] Separate weekend TIFF files exported successfully.\n")
+cat(file.path(output_dir, "Figure_Weekend_A.tiff"), "\n")
+cat(file.path(output_dir, "Figure_Weekend_B.tiff"), "\n")
+cat(file.path(output_dir, "Figure_Weekend_C.tiff"), "\n")
+
+# ------------------------------------------------------------------------------
+# 16.9 Final combined vertical figure
+# ------------------------------------------------------------------------------
+
+Figure_Weekend_Final <- fig_A_final / fig_B_final / fig_C_final +
+  plot_layout(heights = c(1, 1, 1.25))
+
+print(Figure_Weekend_Final)
+
+ggsave(
+  filename = file.path(output_dir, "Figure_Weekend_Final.tiff"),
+  plot = Figure_Weekend_Final,
+  device = "tiff",
+  width = 8.6,
+  height = 16.5,
+  units = "in",
+  dpi = 300,
+  compression = "lzw",
+  bg = "white"
+)
+
+cat("\n[Done] Final combined weekend figure exported successfully.\n")
+cat(file.path(output_dir, "Figure_Weekend_Final.tiff"), "\n")
+
+# ------------------------------------------------------------------------------
+# 16.10 Optional vector PDF export
+# ------------------------------------------------------------------------------
+
+ggsave(
+  filename = file.path(output_dir, "Figure_Weekend_Final.pdf"),
+  plot = Figure_Weekend_Final,
+  device = cairo_pdf,
+  width = 8.6,
+  height = 16.5,
+  units = "in",
+  bg = "white"
+)
+
+cat("\n[Done] Optional weekend PDF exported successfully.\n")
+cat(file.path(output_dir, "Figure_Weekend_Final.pdf"), "\n")
