@@ -1,0 +1,130 @@
+################################################################################
+# SCRIPT: Participant Selection and Analytical Sample Construction
+# STUDY: Sleep Rhythm Disorders and Depression (NHANES 2017-2023)
+# PURPOSE: Sensitivity analysis using PHQ-8 outcomes
+# STANDARDS: STROBE Guidelines / Reproducible Research
+# OUTPUT: Final Analytical Dataset for PHQ-8 Sensitivity Analysis
+################################################################################
+
+# 1. Environment & Libraries ---------------------------------------------------
+library(tidyverse)
+library(tidyr)
+
+# Set working directory
+base_path <- "D:/code"
+setwd(base_path)
+
+# 2. Data Loading --------------------------------------------------------------
+cat("Loading consolidated NHANES master dataset for PHQ-8 sensitivity analysis...\n")
+df_raw <- readRDS("11.Dataset_S_revised_PHQ-8.rds")
+initial_n <- nrow(df_raw)
+
+# 3. Inclusion/Exclusion Workflow (Sequential) ---------------------------------
+
+# 3.1 Step 1: Filter for Sensitivity Outcome (PHQ-8)
+# Main sensitivity analysis uses PHQ8_depression_above_10.
+# The alternative cutoff (PHQ8_depression_above_9) is retained in the dataset
+# for additional robustness analyses.
+df_step1 <- df_raw %>% 
+  filter(!is.na(PHQ8_SCORE), !is.na(PHQ8_depression_above_10))
+
+n_after_phq8 <- nrow(df_step1)
+
+# 3.2 Step 2: Filter for Core Exposure Variables (Sleep Metrics)
+sleep_vars <- c(
+  "SLQ320_min", "SLQ330_min", "midpoint_we",
+  "SLQ300_min", "SLQ310_min", "midpoint_wd",
+  "dur_wd", "dur_we",
+  "dur_wd_cat", "dur_we_cat",
+  "dur_wd_cat_num", "dur_we_cat_num"
+)
+
+df_step2 <- df_step1 %>% 
+  drop_na(all_of(sleep_vars))
+
+n_after_sleep <- nrow(df_step2)
+
+# 3.3 Step 3: Exclude Pregnant Individuals
+# In NHANES, RIDEXPRG == 1 indicates pregnancy.
+# Participants with RIDEXPRG != 1 or missing RIDEXPRG are retained.
+df_step3 <- df_step2 %>%
+  filter(RIDEXPRG != 1 | is.na(RIDEXPRG)) %>%
+  select(-RIDEXPRG)
+
+n_after_preg <- nrow(df_step3)
+
+# 3.4 Step 4: Filter for Remaining Covariates (Complete Case Analysis)
+covariate_vars <- c(
+  "PIR_cat", "PIR_cat_num", "INDFMPIR",
+  "MET_total", "PAD680", "MET_cat_label", "MET_cat_num",
+  "sedentary_min", "sedentary_cat_label", "sedentary_cat_num",
+  "DMDEDUC2", "DMDMARTZ",
+  "Age_cat", "Age_cat_num",
+  "BMI_value", "BMI_cat", "BMI_cat_ordinal",
+  "BMI_detailed", "BMI_detailed_ordinal",
+  "Alcohol_Status", "Alcohol_Label",
+  "smoke_status", "htn_status", "diabetes_status", "work_status"
+)
+
+df_final <- df_step3 %>%
+  drop_na(all_of(covariate_vars))
+
+final_n <- nrow(df_final)
+
+# 4. Exclusion Flow Summary ----------------------------------------------------
+
+exclusion_summary <- data.frame(
+  Step = c(
+    "Initial Cohort (NHANES 2017-2023)",
+    "Completed PHQ-8 Sensitivity Outcome",
+    "Completed Sleep Questionnaires",
+    "Exclusion of Pregnant Individuals",
+    "Final Analytical Sample (Complete Covariates)"
+  ),
+  N = c(initial_n, n_after_phq8, n_after_sleep, n_after_preg, final_n),
+  Excluded = c(
+    0,
+    initial_n - n_after_phq8,
+    n_after_phq8 - n_after_sleep,
+    n_after_sleep - n_after_preg,
+    n_after_preg - final_n
+  )
+)
+
+cat("\n--- PARTICIPANT SELECTION FLOW (PHQ-8 SENSITIVITY ANALYSIS) ---\n")
+print(exclusion_summary)
+
+# 5. Missingness Verification --------------------------------------------------
+
+cat("\n--- FINAL MISSINGNESS DIAGNOSTIC ---\n")
+final_missing_check <- df_final %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "N_Missing") %>%
+  filter(N_Missing > 0)
+
+if (nrow(final_missing_check) == 0) {
+  cat("Success: No missing values found in the final PHQ-8 sensitivity dataset.\n")
+} else {
+  print(final_missing_check)
+  
+  cat("\nNote: No missing values were observed in variables used for the PHQ-8 sensitivity analysis; ")
+  cat("the remaining missing values were limited to PHQ-9 reference variables retained for comparison.\n")
+}
+
+# 6. Quick Outcome Checks ------------------------------------------------------
+
+cat("\n--- OUTCOME DISTRIBUTIONS IN FINAL SAMPLE ---\n")
+cat("\nPHQ-8 >= 10:\n")
+print(table(df_final$PHQ8_depression_above_10, useNA = "always"))
+
+cat("\nPHQ-8 >= 9:\n")
+print(table(df_final$PHQ8_depression_above_9, useNA = "always"))
+
+cat("\nPHQ-9 >= 10 (reference only):\n")
+print(table(df_final$PHQ9_depression_above_10, useNA = "always"))
+
+# 7. Export Final Dataset ------------------------------------------------------
+saveRDS(df_final, "12.Dataset_Sensitivity_PHQ8.rds")
+
+cat("\nFinal dataset dimensions:", dim(df_final)[1], "rows and", dim(df_final)[2], "variables.\n")
+cat("Analytical file saved as: 12.Dataset_Sensitivity_PHQ8.rds\n")
