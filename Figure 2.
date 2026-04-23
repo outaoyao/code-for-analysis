@@ -1,0 +1,196 @@
+# ==============================================================================
+# Final polished Figure 2
+# Combine Figure 2A, Figure 2B, and Figure 2C with a centered shared legend
+#
+# Output:
+#   D:/code/photo/Figure_2_Combined.tiff
+#   D:/code/photo/Figure_2_Combined.png
+# ==============================================================================
+
+# install.packages(c("magick", "cowplot", "ggplot2"))
+
+library(magick)
+library(cowplot)
+library(ggplot2)
+
+# ------------------------------------------------------------------------------
+# 1. Paths
+# ------------------------------------------------------------------------------
+img_dir <- "D:/code/photo"
+
+file_2A <- file.path(img_dir, "Figure_2A_Model4_Fully_Adjusted.tiff")
+file_2B <- file.path(img_dir, "Figure_2B_Model4_Fully_Adjusted.tiff")
+file_2C <- file.path(img_dir, "Figure_2C_Model4_Fully_Adjusted.tiff")
+
+out_tiff <- file.path(img_dir, "Figure_2_Combined.tiff")
+out_png  <- file.path(img_dir, "Figure_2_Combined.png")
+
+# ------------------------------------------------------------------------------
+# 2. Check files
+# ------------------------------------------------------------------------------
+required_files <- c(file_2A, file_2B, file_2C)
+missing_files <- required_files[!file.exists(required_files)]
+
+if (length(missing_files) > 0) {
+  stop(sprintf(
+    "The following input files were not found:\n%s",
+    paste(missing_files, collapse = "\n")
+  ))
+}
+
+# ------------------------------------------------------------------------------
+# 3. Read images
+# ------------------------------------------------------------------------------
+img_2A <- image_read(file_2A)
+img_2B <- image_read(file_2B)
+img_2C <- image_read(file_2C)
+
+# ------------------------------------------------------------------------------
+# 4. Standardize image size
+# ------------------------------------------------------------------------------
+target_width <- 1800
+
+img_2A <- image_resize(img_2A, paste0(target_width))
+img_2B <- image_resize(img_2B, paste0(target_width))
+img_2C <- image_resize(img_2C, paste0(target_width))
+
+g_2A <- ggdraw() + draw_image(img_2A)
+g_2B <- ggdraw() + draw_image(img_2B)
+g_2C <- ggdraw() + draw_image(img_2C)
+
+# ------------------------------------------------------------------------------
+# 5. Main panel row
+# ------------------------------------------------------------------------------
+main_row <- plot_grid(
+  g_2A, g_2B, g_2C,
+  ncol = 3,
+  align = "h",
+  rel_widths = c(1, 1, 1)
+)
+
+# ------------------------------------------------------------------------------
+# 6. Shared legend
+# ------------------------------------------------------------------------------
+# Layout principle:
+# - centered title
+# - four evenly spaced legend items
+# - consistent line length and text alignment
+
+y_title <- 0.76
+y_item  <- 0.34
+line_len <- 0.045
+text_gap <- 0.015
+
+x_line_start <- c(0.07, 0.31, 0.57, 0.84)
+x_line_end   <- x_line_start + line_len
+x_text       <- x_line_end + text_gap
+
+shared_legend <- ggdraw() +
+  draw_label(
+    "Schedule",
+    x = 0.5, y = y_title,
+    fontface = "bold",
+    fontfamily = "Arial",
+    size = 11,
+    hjust = 0.5
+  ) +
+  
+  # Weekday (Onset)
+  draw_line(
+    x = c(x_line_start[1], x_line_end[1]),
+    y = c(y_item, y_item),
+    color = "#0072B2",
+    linewidth = 1.5
+  ) +
+  draw_label(
+    "Weekday (Onset)",
+    x = x_text[1], y = y_item,
+    fontfamily = "Arial",
+    size = 10,
+    hjust = 0
+  ) +
+  
+  # Weekday (Midpoint)
+  draw_line(
+    x = c(x_line_start[2], x_line_end[2]),
+    y = c(y_item, y_item),
+    color = "#009E73",
+    linewidth = 1.5
+  ) +
+  draw_label(
+    "Weekday (Midpoint)",
+    x = x_text[2], y = y_item,
+    fontfamily = "Arial",
+    size = 10,
+    hjust = 0
+  ) +
+  
+  # Weekday (Wake-up)
+  draw_line(
+    x = c(x_line_start[3], x_line_end[3]),
+    y = c(y_item, y_item),
+    color = "#CC79A7",
+    linewidth = 1.5
+  ) +
+  draw_label(
+    "Weekday (Wake-up)",
+    x = x_text[3], y = y_item,
+    fontfamily = "Arial",
+    size = 10,
+    hjust = 0
+  ) +
+  
+  # Weekend
+  draw_line(
+    x = c(x_line_start[4], x_line_end[4]),
+    y = c(y_item, y_item),
+    color = "#D55E00",
+    linewidth = 1.5
+  ) +
+  draw_label(
+    "Weekend",
+    x = x_text[4], y = y_item,
+    fontfamily = "Arial",
+    size = 10,
+    hjust = 0
+  )
+
+# ------------------------------------------------------------------------------
+# 7. Combine panels and legend
+# ------------------------------------------------------------------------------
+figure_2_combined <- plot_grid(
+  main_row,
+  shared_legend,
+  ncol = 1,
+  rel_heights = c(1, 0.15)
+)
+
+# ------------------------------------------------------------------------------
+# 8. Export
+# ------------------------------------------------------------------------------
+ggsave(
+  filename = out_tiff,
+  plot = figure_2_combined,
+  device = "tiff",
+  dpi = 600,
+  width = 15.4,
+  height = 5.35,
+  units = "in",
+  compression = "lzw",
+  bg = "white"
+)
+
+ggsave(
+  filename = out_png,
+  plot = figure_2_combined,
+  device = "png",
+  dpi = 300,
+  width = 15.4,
+  height = 5.35,
+  units = "in",
+  bg = "white"
+)
+
+message(sprintf("[OK] Combined TIFF exported: %s", out_tiff))
+message(sprintf("[OK] Combined PNG exported: %s", out_png))
+message("[DONE] Final polished Figure 2 created successfully.")
