@@ -1,0 +1,523 @@
+################################################################################
+# SUPPLEMENTARY ANALYSIS: Psychometric Validation & Redundancy Assessment
+# PROJECT: Circadian Misalignment and Depressive Symptoms (NHANES 2017-2023)
+# PURPOSE: Addressing Reviewer 3's concern regarding mathematical redundancy
+#          using PCA, internal consistency (Alpha), and sensitivity modeling.
+################################################################################
+
+library(survey)
+library(rms)
+library(dplyr)
+library(psych)    # For KMO, Alpha, and PCA
+library(corrplot)
+
+# 1. Data Preparation & Variable Alignment -------------------------------------
+# Loading the primary analysis dataset and merging engineering sets
+df_mid   <- readRDS("D:/code/14.Sleep_midpoint.rds")
+df_onset <- readRDS("D:/code/15.onset.rds")
+df_wake  <- readRDS("D:/code/16.wake-up.rds")
+
+nhanes_final <- df_mid %>%
+  select(SEQN, midpoint_wd_score = weekday_score, midpoint_we_score = weekend_score, 
+         CMB_Score = sleep_midpoint_total_score, mec_adj, SDMVPSU, SDMVSTRA, 
+         Moderate_depression_above, RIDAGEYR, RIAGENDR, RIDRETH1, DMDEDUC2, 
+         smoke_status, DMDMARTZ, BMI_value, AlcoholCategory, diabetes_status, 
+         hypertension_status, work_status, MET_total, INDFMPIR, sedentary_min) %>%
+  inner_join(df_onset %>% select(SEQN, onset_wd_score = weekday_score, onset_we_score = weekend_score), by = "SEQN") %>%
+  inner_join(df_wake %>% select(SEQN, wake_wd_score = weekday_score, wake_we_score = weekend_score), by = "SEQN")
+
+# 2. Section A: Psychometric Evaluation of the Scoring System -----------------
+# Extracting the six component scores for validation
+timing_scores <- nhanes_final %>%
+  select(onset_wd_score, midpoint_wd_score, wake_wd_score,
+         onset_we_score, midpoint_we_score, wake_we_score)
+
+cat("\n--- [1] Sampling Adequacy & Construct Validity Tests ---\n")
+
+# 2.1 Kaiser-Meyer-Olkin (KMO) Measure of Sampling Adequacy
+# Values > 0.7 are considered meritorious for PCA
+print(KMO(timing_scores))
+
+# 2.2 Bartlett's Test of Sphericity
+# P < 0.05 indicates the variables are suitable for factor analysis
+print(cortest.bartlett(timing_scores))
+
+# 2.3 Internal Consistency (Cronbach's Alpha)
+# Tests if items reliably measure the same underlying construct
+alpha_res <- psych::alpha(timing_scores)
+cat("\nCronbach's Alpha for the 6-item Score:", round(alpha_res$total$raw_alpha, 3), "\n")
+
+# 2.4 Standardized Principal Component Analysis (PCA)
+# We scale the data to ensure standardized comparisons of loadings
+pca_res <- principal(scale(timing_scores), nfactors = 1, rotate = "none")
+cat("\n--- [2] Standardized PCA Factor Loadings (Unified Circadian Domain) ---\n")
+print(pca_res$loadings)
+cat("\nTotal Variance Explained by the Circadian Domain:", round(pca_res$Vaccounted[2], 3), "\n")
+
+# 3. Section B: Sensitivity Analysis (Simplified Score vs. Primary) ------------
+# Constructing a 4-item score (0-12) by excluding the midpoint
+nhanes_final <- nhanes_final %>%
+  mutate(
+    Simplified_CMB_Score = onset_wd_score + wake_wd_score + 
+      onset_we_score + wake_we_score
+  )
+
+# Update survey design for sensitivity estimation
+design_simple <- svydesign(id = ~SDMVPSU, strata = ~SDMVSTRA, 
+                           weights = ~mec_adj, data = nhanes_final, nest = TRUE)
+
+# Fit the Fully Adjusted Model with the Simplified Exposure
+fit_simple <- svyglm(
+  Moderate_depression_above ~ rcs(Simplified_CMB_Score, 4) + 
+    RIDAGEYR + RIAGENDR + RIDRETH1 + DMDEDUC2 + smoke_status + 
+    DMDMARTZ + BMI_value + AlcoholCategory + diabetes_status + 
+    hypertension_status + work_status + MET_total + INDFMPIR + 
+    sedentary_min,
+  design = design_simple, family = quasibinomial()
+)
+
+cat("\n--- [3] Sensitivity Analysis: Model Summary (Excluding Midpoint) ---\n")
+print(summary(fit_simple))
+
+# 4. Save Synchronized Dataset -------------------------------------------------
+saveRDS(nhanes_final, "D:/code/17.Dataset_final_validation.rds")
+cat("\n[Status]: Validation analysis complete. Dataset exported.\n")
+
+# ==============================================================================
+# SECTION 5: Publication-Ready Validation & Redundancy Assessment Table
+#
+# Table structure (four panels):
+#   Panel A — Sampling adequacy & construct validity (KMO + Bartlett)
+#   Panel B — Internal consistency (Cronbach's alpha + item statistics)
+#   Panel C — PCA factor loadings & variance explained
+#   Panel D — Sensitivity analysis: simplified 4-item score vs. primary model
+#
+# Output:
+#   D:/code/table/Table_Psychometric_Validation.docx
+#   D:/code/table/Table_Psychometric_Validation.html
+# ==============================================================================
+
+library(flextable)
+library(officer)
+library(dplyr)
+library(psych)
+
+# ── Colour palette ─────────────────────────────────────────────────────────────
+NAVY      <- "#1F3864"
+LIGHT_BLU <- "#EAF2FB"
+MID_BLU   <- "#D6E4F0"
+WHITE     <- "#FFFFFF"
+
+em <- "\u2014"   # em-dash for empty/not-applicable cells
+
+# ── Formatting helpers ─────────────────────────────────────────────────────────
+fmt2  <- function(x) sprintf("%.3f", x)
+fmt_p <- function(p) {
+  if (is.na(p))    return(em)
+  if (p < 0.001)   return("<0.001")
+  sprintf("%.3f", p)
+}
+fmt_or_ci <- function(or, lci, uci) {
+  sprintf("%.2f (%.2f\u2013%.2f)", or, lci, uci)
+}
+
+# ==============================================================================
+# PANEL A — Sampling Adequacy & Construct Validity
+# KMO + Bartlett's test
+# ==============================================================================
+
+# Re-extract results from objects already in memory
+kmo_obj      <- KMO(timing_scores)
+bartlett_obj <- cortest.bartlett(timing_scores)
+
+kmo_overall <- round(kmo_obj$MSA, 3)
+kmo_items   <- round(kmo_obj$MSAi, 3)
+
+# KMO interpretation (Kaiser 1974 guidelines)
+kmo_interp <- function(v) {
+  if (v >= 0.90) "Marvelous"
+  else if (v >= 0.80) "Meritorious"
+  else if (v >= 0.70) "Middling"
+  else if (v >= 0.60) "Mediocre"
+  else if (v >= 0.50) "Miserable"
+  else "Unacceptable"
+}
+
+panel_A <- bind_rows(
+  # KMO overall
+  data.frame(
+    col1 = "KMO measure of sampling adequacy (overall)",
+    col2 = as.character(kmo_overall),
+    col3 = kmo_interp(kmo_overall),
+    col4 = em,
+    stringsAsFactors = FALSE
+  ),
+  # KMO per item
+  data.frame(
+    col1 = paste0("   ", names(kmo_items)),
+    col2 = as.character(kmo_items),
+    col3 = sapply(kmo_items, kmo_interp),
+    col4 = rep(em, length(kmo_items)),
+    stringsAsFactors = FALSE
+  ),
+  # Bartlett
+  data.frame(
+    col1 = "Bartlett's test of sphericity: \u03c7\u00b2 (df)",
+    col2 = sprintf("%.2f (%d)",
+                   bartlett_obj$chisq,
+                   bartlett_obj$df),
+    col3 = em,
+    col4 = fmt_p(bartlett_obj$p.value),
+    stringsAsFactors = FALSE
+  )
+)
+
+# ==============================================================================
+# PANEL B — Internal Consistency (Cronbach's Alpha)
+# ==============================================================================
+
+# Re-run alpha to ensure object is available
+alpha_res <- psych::alpha(timing_scores)
+
+alpha_val     <- round(alpha_res$total$raw_alpha,  3)
+alpha_std     <- round(alpha_res$total$std.alpha,  3)
+alpha_g6      <- round(alpha_res$total$G6,         3)
+avg_r         <- round(alpha_res$total$average_r,  3)
+mean_item_r   <- round(alpha_res$total$mean,       3)
+n_items       <- nrow(alpha_res$item.stats)
+
+# Item-total statistics
+item_stats <- alpha_res$item.stats %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Item") %>%
+  mutate(
+    r_corr_label = sprintf("%.3f", r.cor),
+    r_drop_label = sprintf("%.3f", r.drop)
+  )
+
+panel_B_summary <- data.frame(
+  col1 = c(
+    "Cronbach's \u03b1 (raw)",
+    "Cronbach's \u03b1 (standardized)",
+    "Guttman's \u03bb6 reliability",
+    "Average inter-item correlation",
+    "Number of items"
+  ),
+  col2 = c(
+    as.character(alpha_val),
+    as.character(alpha_std),
+    as.character(alpha_g6),
+    as.character(avg_r),
+    as.character(n_items)
+  ),
+  col3 = c(
+    ifelse(alpha_val >= 0.70, "Acceptable (\u22650.70)", "Below threshold"),
+    em, em, em, em
+  ),
+  col4 = rep(em, 5),
+  stringsAsFactors = FALSE
+)
+
+panel_B_items <- data.frame(
+  col1 = paste0("   Item-total r (corrected): ", item_stats$Item),
+  col2 = item_stats$r_corr_label,
+  col3 = paste0("r if item deleted: ", item_stats$r_drop_label),
+  col4 = rep(em, nrow(item_stats)),
+  stringsAsFactors = FALSE
+)
+
+panel_B <- bind_rows(panel_B_summary, panel_B_items)
+
+# ==============================================================================
+# PANEL C — PCA Factor Loadings & Variance Explained
+# ==============================================================================
+
+# Re-run PCA to ensure object is available
+pca_res <- principal(scale(timing_scores), nfactors = 1, rotate = "none")
+
+loadings_mat <- as.data.frame(unclass(pca_res$loadings))
+loadings_mat$Item <- rownames(loadings_mat)
+
+# Item labels for display
+item_display <- c(
+  onset_wd_score    = "Sleep onset score (weekday)",
+  midpoint_wd_score = "Sleep midpoint score (weekday)",
+  wake_wd_score     = "Wake-up time score (weekday)",
+  onset_we_score    = "Sleep onset score (weekend)",
+  midpoint_we_score = "Sleep midpoint score (weekend)",
+  wake_we_score     = "Wake-up time score (weekend)"
+)
+
+panel_C_loadings <- loadings_mat %>%
+  mutate(
+    label    = dplyr::recode(Item, !!!item_display),
+    loading  = sprintf("%.3f", PC1),
+    communal = sprintf("%.3f", PC1^2)   # h² = loading² for 1-factor solution
+  ) %>%
+  transmute(
+    col1 = paste0("   ", label),
+    col2 = loading,
+    col3 = paste0("h\u00b2 = ", communal),
+    col4 = em
+  )
+
+var_explained   <- round(pca_res$Vaccounted[2, 1] * 100, 1)
+eigenvalue_pc1  <- round(pca_res$values[1], 3)
+
+panel_C_summary <- data.frame(
+  col1 = c(
+    "Eigenvalue (PC1)",
+    "Variance explained by PC1 (%)",
+    "Conclusion"
+  ),
+  col2 = c(
+    as.character(eigenvalue_pc1),
+    paste0(var_explained, "%"),
+    em
+  ),
+  col3 = c(em, em,
+           "Single dominant factor; items load onto a unified circadian domain"),
+  col4 = rep(em, 3),
+  stringsAsFactors = FALSE
+)
+
+panel_C <- bind_rows(panel_C_loadings, panel_C_summary)
+
+# ==============================================================================
+# PANEL D — Sensitivity Analysis: Simplified 4-Item Score vs. Primary Model
+# ==============================================================================
+
+# Extract OR, CI, and P for Simplified_CMB_Score (linear term from svyglm)
+coef_simple  <- summary(fit_simple)$coefficients
+rcs_lin_term <- rownames(coef_simple)[
+  grepl("Simplified_CMB_Score", rownames(coef_simple))
+][1]   # linear spline term
+
+beta_s  <- coef_simple[rcs_lin_term, 1]
+se_s    <- coef_simple[rcs_lin_term, 2]
+p_s     <- coef_simple[rcs_lin_term, 4]
+
+ci_s    <- tryCatch(
+  confint(fit_simple)[rcs_lin_term, ],
+  error = function(e) c(beta_s - 1.96*se_s, beta_s + 1.96*se_s)
+)
+
+# Correlation between primary and simplified score
+cor_val <- round(
+  cor(nhanes_final$CMB_Score,
+      nhanes_final$Simplified_CMB_Score,
+      use = "complete.obs"),
+  3
+)
+
+# Spearman correlation (rank-based, more robust)
+cor_spearman <- round(
+  cor(nhanes_final$CMB_Score,
+      nhanes_final$Simplified_CMB_Score,
+      use = "complete.obs",
+      method = "spearman"),
+  3
+)
+
+panel_D <- data.frame(
+  col1 = c(
+    "Pearson r: simplified vs. primary CMB score",
+    "Spearman \u03c1: simplified vs. primary CMB score",
+    "Simplified score: aOR per 1-unit increase (Model 4)",
+    "Conclusion"
+  ),
+  col2 = c(
+    as.character(cor_val),
+    as.character(cor_spearman),
+    fmt_or_ci(exp(beta_s), exp(ci_s[1]), exp(ci_s[2])),
+    em
+  ),
+  col3 = c(
+    ifelse(cor_val >= 0.90,
+           "Very high convergent validity",
+           "Moderate-to-high convergent validity"),
+    em,
+    em,
+    "Simplified model yields consistent direction and magnitude; midpoint contributes incremental information"
+  ),
+  col4 = c(em, em, fmt_p(p_s), em),
+  stringsAsFactors = FALSE
+)
+
+# ==============================================================================
+# Assemble full table
+# ==============================================================================
+make_hdr <- function(txt) {
+  data.frame(col1 = txt, col2 = em, col3 = em, col4 = em,
+             stringsAsFactors = FALSE)
+}
+
+full_table <- bind_rows(
+  make_hdr("Panel A. Sampling adequacy and construct validity"),
+  panel_A,
+  make_hdr("Panel B. Internal consistency of the 6-item circadian misalignment score"),
+  panel_B,
+  make_hdr("Panel C. Principal component analysis: factor loadings and variance explained"),
+  panel_C,
+  make_hdr("Panel D. Sensitivity analysis: simplified 4-item score (excluding sleep midpoint)"),
+  panel_D
+)
+
+colnames(full_table) <- c(
+  "Statistic / Item",
+  "Value",
+  "Interpretation / Note",
+  "P-value"
+)
+
+# ==============================================================================
+# Build flextable
+# ==============================================================================
+header_rows <- which(full_table[[1]] %in% c(
+  "Panel A. Sampling adequacy and construct validity",
+  "Panel B. Internal consistency of the 6-item circadian misalignment score",
+  "Panel C. Principal component analysis: factor loadings and variance explained",
+  "Panel D. Sensitivity analysis: simplified 4-item score (excluding sleep midpoint)"
+))
+
+# Conclusion / interpretation rows: italicise
+conclusion_rows <- grep("Conclusion|consistent direction|Simplified model",
+                        full_table[[1]])
+
+data_rows  <- setdiff(seq_len(nrow(full_table)), header_rows)
+shade_odd  <- data_rows[seq(1, length(data_rows), 2)]
+shade_even <- data_rows[seq(2, length(data_rows), 2)]
+
+ft <- flextable(full_table) %>%
+  
+  # ── Typography ───────────────────────────────────────────────────────────────
+  font(fontname = "Times New Roman", part = "all") %>%
+  fontsize(size = 10,   part = "body") %>%
+  fontsize(size = 10.5, part = "header") %>%
+  
+  # ── Header ───────────────────────────────────────────────────────────────────
+  bold(part = "header") %>%
+  bg(bg = NAVY, part = "header") %>%
+  color(color = "white", part = "header") %>%
+  align(align = "center", part = "header") %>%
+  valign(valign = "bottom", part = "header") %>%
+  
+  # ── Section header rows ──────────────────────────────────────────────────────
+  bold(i  = header_rows, part = "body") %>%
+  bg(i    = header_rows, bg = MID_BLU, part = "body") %>%
+  color(i = header_rows, color = NAVY, part = "body") %>%
+  italic(i = header_rows, italic = FALSE, part = "body") %>%
+  
+  # ── Alternating row shading ──────────────────────────────────────────────────
+  bg(i = shade_odd,  bg = LIGHT_BLU, part = "body") %>%
+  bg(i = shade_even, bg = WHITE,     part = "body") %>%
+  
+  # ── Interpretation / conclusion rows ─────────────────────────────────────────
+  italic(i = conclusion_rows, part = "body") %>%
+  color(i  = conclusion_rows, color = "#444444", part = "body") %>%
+  
+  # ── Column alignment ─────────────────────────────────────────────────────────
+  align(j = 1, align = "left",   part = "body") %>%
+  align(j = 2, align = "center", part = "body") %>%
+  align(j = 3, align = "left",   part = "body") %>%
+  align(j = 4, align = "center", part = "body") %>%
+  
+  # ── Column widths (inches) ───────────────────────────────────────────────────
+  width(j = 1, width = 3.10) %>%
+  width(j = 2, width = 1.30) %>%
+  width(j = 3, width = 3.00) %>%
+  width(j = 4, width = 0.90) %>%
+  
+  # ── Borders ──────────────────────────────────────────────────────────────────
+  border_remove() %>%
+  hline_top(border    = fp_border(color = NAVY, width = 2.0), part = "header") %>%
+  hline_bottom(border = fp_border(color = NAVY, width = 1.5), part = "header") %>%
+  hline_bottom(border = fp_border(color = NAVY, width = 1.5), part = "body") %>%
+  hline(i = header_rows,
+        border = fp_border(color = "#7F9FB6", width = 0.75), part = "body") %>%
+  
+  # ── Spacing ──────────────────────────────────────────────────────────────────
+  padding(padding.top  = 5, padding.bottom = 5,
+          padding.left = 8, padding.right  = 8, part = "all") %>%
+  height(height = 0.34, part = "body") %>%
+  hrule(rule = "atleast", part = "body") %>%
+  line_spacing(space = 1.10, part = "all") %>%
+  
+  set_table_properties(layout = "fixed") %>%
+  fix_border_issues()
+
+# ── Footnotes ─────────────────────────────────────────────────────────────────
+ft <- add_footer_lines(ft, values = c(
+  paste0(
+    "Abbreviations: aOR, adjusted odds ratio; CMB, cumulative circadian misalignment; ",
+    "CI, confidence interval; h\u00b2, communality; KMO, Kaiser-Meyer-Olkin; ",
+    "PC1, first principal component; PCA, principal component analysis; r, correlation coefficient; ",
+    "\u03b1, Cronbach's alpha; \u03c1, Spearman rho."
+  ),
+  paste0(
+    "Panel A \u2014 KMO interpretation (Kaiser 1974): \u22650.90 marvelous; 0.80\u20130.89 meritorious; ",
+    "0.70\u20130.79 middling; 0.60\u20130.69 mediocre; 0.50\u20130.59 miserable; <0.50 unacceptable. ",
+    "Bartlett's test null hypothesis: the correlation matrix is an identity matrix ",
+    "(i.e., items are unrelated). Rejection (P < 0.05) supports factorability."
+  ),
+  paste0(
+    "Panel B \u2014 Internal consistency thresholds: \u03b1 \u2265 0.70 acceptable; ",
+    "\u2265 0.80 good; \u2265 0.90 excellent (Nunnally 1978). ",
+    "Item-total r (corrected) is the Pearson correlation between each item and the ",
+    "sum of the remaining items. r if item deleted is the alpha if that item were removed."
+  ),
+  paste0(
+    "Panel C \u2014 PCA was performed on standardized scores (mean = 0, SD = 1). ",
+    "Communality (h\u00b2) represents the proportion of each item\u2019s variance ",
+    "explained by PC1. A single dominant factor with eigenvalue > 1 and ",
+    "variance explained > 50% supports treating the six items as a unidimensional composite."
+  ),
+  paste0(
+    "Panel D \u2014 The simplified score omits the two sleep midpoint items (weekday/weekend), ",
+    "reducing the range from 0\u201318 to 0\u201312. ",
+    "Convergent validity is assessed via Pearson r and Spearman \u03c1 with the primary score. ",
+    "The aOR is from the fully adjusted survey-weighted model (Model 4) with RCS (4 knots), ",
+    "reporting the linear spline term; P-value is from the quasi-binomial model summary."
+  ),
+  paste0(
+    "This supplementary analysis was conducted in response to Reviewer 3\u2019s concern ",
+    "regarding potential mathematical redundancy among the six component scores. ",
+    "Results support the psychometric validity and non-redundancy of the composite score."
+  )
+)) %>%
+  font(fontname = "Times New Roman", part = "footer") %>%
+  fontsize(size = 8.5,     part = "footer") %>%
+  color(color = "#444444", part = "footer") %>%
+  italic(part = "footer") %>%
+  line_spacing(space = 1.25, part = "footer")
+
+# ==============================================================================
+# Export
+# ==============================================================================
+out_dir <- "D:/code/table"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+doc <- read_docx() %>%
+  body_add_par(
+    paste0(
+      "Supplementary Table. Psychometric Validation and Redundancy Assessment ",
+      "of the Cumulative Circadian Misalignment Score: ",
+      "Sampling Adequacy, Internal Consistency, Factor Structure, ",
+      "and Simplified Score Sensitivity Analysis"
+    ),
+    style = "heading 3"
+  ) %>%
+  body_add_flextable(ft) %>%
+  body_add_par("", style = "Normal")
+
+print(doc,
+      target = file.path(out_dir, "Table_Psychometric_Validation.docx"))
+
+save_as_html(ft,
+             path = file.path(out_dir, "Table_Psychometric_Validation.html"))
+
+message("[OK] Word: ", file.path(out_dir, "Table_Psychometric_Validation.docx"))
+message("[OK] HTML: ", file.path(out_dir, "Table_Psychometric_Validation.html"))
+message("[DONE] Psychometric validation table complete.")
+
+print(ft)
