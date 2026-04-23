@@ -1,0 +1,719 @@
+################################################################################
+# SENSITIVITY ANALYSIS: Survey-weighted Restricted Cubic Splines with
+# multiply imputed data
+#
+# PURPOSE:
+# - Merge PHQ9_depression_above_10 from 2.data_phq8.rds into each imputed
+#   dataset from 13.PHQ8_MI_scored_datasets_list_v2.rds
+# - Use PHQ-9 >= 10 as the sensitivity-analysis outcome
+# - Fit survey-weighted RCS logistic regression models with MI pooling
+# - Estimate overall association and non-linearity (Wald tests)
+# - Derive pooled nadir and risk-escalation point from Model 4 spline curve
+# - Perform secondary analysis using the RCS-derived categorized exposure
+# - Export Supplementary Figure G in TIFF / PDF / PNG
+#
+# COLOR:  #0072B2  (Okabe-Ito blue — colorblind-safe, distinct from Figure F)
+# PANEL LABEL: G
+#
+# NOTES:
+# - Observational, cross-sectional analysis. No causal language.
+# - P-values from MI-pooled Wald tests.
+################################################################################
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(survey)
+  library(mitools)
+  library(Hmisc)      # rcspline.eval
+  library(ggplot2)
+  library(car)
+})
+
+options(survey.lonely.psu = "adjust")
+
+# ==============================================================================
+# SECTION 0: Paths
+# ==============================================================================
+
+base_path <- "D:/code"
+setwd(base_path)
+
+input_mi_file  <- "13.PHQ8_MI_scored_datasets_list_v2.rds"
+input_phq9_file <- "2.data_phq8.rds"   # contains PHQ9_depression_above_10
+
+out_dir <- "D:/code/photo"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+cat("============================================================\n")
+cat("RCS SENSITIVITY ANALYSIS STARTED: PHQ-9 >= 10 (Panel G)\n")
+cat("============================================================\n\n")
+
+# ==============================================================================
+# SECTION 1: Load data
+# ==============================================================================
+
+complete_list_raw <- readRDS(input_mi_file)
+data_phq9         <- readRDS(input_phq9_file)
+
+cat("MI datasets loaded.  N imputations:", length(complete_list_raw), "\n")
+cat("PHQ-9 source dataset loaded.  Rows:", nrow(data_phq9), "\n\n")
+
+# ==============================================================================
+# SECTION 2: Validate and prepare the PHQ-9 outcome column
+# ==============================================================================
+
+# ---- 2a. Confirm or derive PHQ9_depression_above_10 -------------------------
+if (!"PHQ9_depression_above_10" %in% names(data_phq9)) {
+  
+  # Try to derive from a raw PHQ-9 total score column.
+  # Adjust the column name below if your dataset uses a different name.
+  phq9_score_col <- intersect(
+    names(data_phq9),
+    c("PHQ9_SCORE", "PHQ9_score", "phq9_score", "PHQ9SCORE")
+  )
+  
+  if (length(phq9_score_col) == 0) {
+    stop(paste(
+      "PHQ9_depression_above_10 not found in", input_phq9_file,
+      "and no recognised PHQ-9 total score column was detected.",
+      "Please check the column names in that file."
+    ))
+  }
+  
+  sc <- phq9_score_col[1]
+  message("Deriving PHQ9_depression_above_10 from column: ", sc)
+  
+  data_phq9 <- data_phq9 %>%
+    mutate(
+      PHQ9_depression_above_10 = case_when(
+        .data[[sc]] >= 10 ~ 1L,
+        .data[[sc]] <  10 ~ 0L,
+        TRUE ~ NA_integer_
+      )
+    )
+}
+
+cat("PHQ9_depression_above_10 prevalence (source file):\n")
+print(table(data_phq9$PHQ9_depression_above_10, useNA = "ifany"))
+cat("\n")
+
+# ---- 2b. Identify the participant ID for merging ----------------------------
+# We need a key that exists in BOTH the MI datasets and data_phq9.
+# Common NHANES identifiers: SEQN.  Adjust if yours differs.
+id_candidates <- intersect(
+  names(complete_list_raw[[1]]),
+  names(data_phq9)
+)
+id_candidates <- id_candidates[id_candidates %in% c("SEQN", "seqn", "ID", "id")]
+
+if (length(id_candidates) == 0) {
+  stop(paste(
+    "No common participant ID column (e.g., SEQN) found between the MI",
+    "datasets and", input_phq9_file,
+    ". Please specify the merge key manually."
+  ))
+}
+
+merge_key <- id_candidates[1]
+cat("Merging on column:", merge_key, "\n\n")
+
+# ---- 2c. Keep only the key + outcome from the PHQ-9 file --------------------
+phq9_merge <- data_phq9 %>%
+  select(all_of(c(merge_key, "PHQ9_depression_above_10"))) %>%
+  distinct(across(all_of(merge_key)), .keep_all = TRUE)
+
+# ==============================================================================
+# SECTION 3: Merge PHQ-9 outcome into every imputed dataset
+# ==============================================================================
+
+complete_list_scored <- lapply(complete_list_raw, function(df) {
+  
+  # Drop pre-existing column if present (avoid .x / .y conflicts)
+  if ("PHQ9_depression_above_10" %in% names(df)) {
+    df <- df %>% select(-PHQ9_depression_above_10)
+  }
+  
+  df <- df %>%
+    left_join(phq9_merge, by = merge_key)
+  
+  df
+})
+
+# Quick check on merge success
+n_merged <- sum(!is.na(complete_list_scored[[1]]$PHQ9_depression_above_10))
+cat("Rows with non-missing PHQ9_depression_above_10 after merge (imp 1):",
+    n_merged, "/", nrow(complete_list_scored[[1]]), "\n\n")
+
+# ==============================================================================
+# SECTION 4: Analysis settings
+# ==============================================================================
+
+OUTCOME_VAR  <- "PHQ9_depression_above_10"
+EXPOSURE_VAR <- "sleep_timing_total_score"
+EXPOSURE_LAB <- "Cumulative Circadian Misalignment Score"
+
+adj_demographic <- "RIDAGEYR + RIAGENDR + RIDRETH1"
+
+adj_full_core <- paste(
+  "RIDAGEYR + RIAGENDR + RIDRETH1 +",
+  "DMDEDUC2 + smoke_status + DMDMARTZ + BMI_value + AlcoholCategory +",
+  "diabetes_status + hypertension_status + work_status + MET_total + INDFMPIR"
+)
+
+adj_full_plus <- paste(adj_full_core, "+ sedentary_min")
+
+# Harrell-style 4-knot locations from first imputed dataset
+x_ref      <- complete_list_scored[[1]][[EXPOSURE_VAR]]
+knots_rcs  <- as.numeric(quantile(x_ref, probs = c(0.05, 0.35, 0.65, 0.95), na.rm = TRUE))
+ref_value  <- median(x_ref, na.rm = TRUE)
+
+cat("Spline knot locations:\n"); print(knots_rcs)
+cat("Reference value (median):", round(ref_value, 4), "\n\n")
+
+# ==============================================================================
+# SECTION 5: Helper functions
+# ==============================================================================
+
+fmt_or <- function(or, lci, uci, digits = 2) {
+  sprintf(paste0("%.", digits, "f (%.", digits, "f-%.", digits, "f)"),
+          or, lci, uci)
+}
+
+fmt_p <- function(p) {
+  if (is.na(p)) return(NA_character_)
+  if (p < 0.001) return("<0.001")
+  sprintf("%.3f", p)
+}
+
+fmt_p_fig <- function(p) {
+  if (is.na(p))  return(NA_character_)
+  if (p < 0.001) return("< 0.001")
+  sprintf("= %.3f", p)
+}
+
+build_rcs_basis_df <- function(x, knots) {
+  basis <- as.data.frame(rcspline.eval(x, knots = knots, inclx = TRUE))
+  names(basis) <- c("rcs_lin", paste0("rcs_nonlin", seq_len(ncol(basis) - 1)))
+  basis
+}
+
+build_model_data <- function(df, xvar, knots) {
+  bind_cols(df, build_rcs_basis_df(df[[xvar]], knots))
+}
+
+pool_coef_vcov <- function(fit_list) {
+  m          <- length(fit_list)
+  coef_list  <- lapply(fit_list, coef)
+  vcov_list  <- lapply(fit_list, vcov)
+  coef_names <- names(coef_list[[1]])
+  Q          <- do.call(cbind, coef_list)
+  qbar       <- rowMeans(Q)
+  Ubar       <- Reduce(`+`, vcov_list) / m
+  centered   <- lapply(coef_list, function(b) matrix(b - qbar, ncol = 1))
+  B          <- Reduce(`+`, lapply(centered, function(d) d %*% t(d))) / (m - 1)
+  Tmat       <- Ubar + (1 + 1 / m) * B
+  rownames(Tmat) <- coef_names; colnames(Tmat) <- coef_names
+  list(coef = qbar, vcov = Tmat, coef_names = coef_names, m = m)
+}
+
+wald_test_terms <- function(beta, vcov_mat, term_names) {
+  b    <- beta[term_names]
+  V    <- vcov_mat[term_names, term_names, drop = FALSE]
+  stat <- as.numeric(t(b) %*% solve(V) %*% b)
+  df   <- length(term_names)
+  tibble(chisq = stat, df = df, p_value = pchisq(stat, df, lower.tail = FALSE))
+}
+
+make_rcs_formula <- function(outcome, covariates = NULL) {
+  rhs <- c("rcs_lin", "rcs_nonlin1", "rcs_nonlin2")
+  if (!is.null(covariates)) rhs <- c(rhs, covariates)
+  as.formula(paste(outcome, "~", paste(rhs, collapse = " + ")))
+}
+
+fit_rcs_on_dataset <- function(df, formula_obj) {
+  design <- svydesign(id = ~SDMVPSU, strata = ~SDMVSTRA,
+                      weights = ~mec_adj, data = df, nest = TRUE)
+  svyglm(formula_obj, design = design, family = quasibinomial())
+}
+
+predict_pooled_rcs <- function(pool_obj, x_grid, ref_value, knots,
+                               baseline_df, covariate_formula) {
+  grid_basis <- build_rcs_basis_df(x_grid, knots)
+  ref_basis  <- build_rcs_basis_df(ref_value, knots)
+  
+  newdata_grid <- bind_cols(baseline_df[rep(1, length(x_grid)), , drop = FALSE], grid_basis)
+  newdata_ref  <- bind_cols(baseline_df[rep(1, 1),              , drop = FALSE], ref_basis)
+  
+  mm_grid <- model.matrix(covariate_formula, data = newdata_grid)
+  mm_ref  <- model.matrix(covariate_formula, data = newdata_ref)
+  
+  beta     <- pool_obj$coef
+  V        <- pool_obj$vcov
+  diff_mat <- sweep(mm_grid, 2, mm_ref[1, ], FUN = "-")
+  log_or   <- as.numeric(diff_mat %*% beta)
+  
+  se_log_or <- apply(diff_mat, 1, function(d) sqrt(as.numeric(t(d) %*% V %*% d)))
+  
+  tibble(x = x_grid, log_or = log_or,
+         OR  = exp(log_or),
+         LCI = exp(log_or - 1.96 * se_log_or),
+         UCI = exp(log_or + 1.96 * se_log_or))
+}
+
+make_reference_row <- function(df) {
+  ref <- df %>%
+    summarise(RIDAGEYR     = median(RIDAGEYR,     na.rm = TRUE),
+              BMI_value    = median(BMI_value,    na.rm = TRUE),
+              MET_total    = median(MET_total,    na.rm = TRUE),
+              INDFMPIR     = median(INDFMPIR,     na.rm = TRUE),
+              sedentary_min= median(sedentary_min,na.rm = TRUE))
+  
+  get_mode <- function(x) {
+    ux <- na.omit(x)
+    names(sort(table(ux), decreasing = TRUE))[1]
+  }
+  
+  for (fv in c("RIAGENDR","RIDRETH1","DMDEDUC2","smoke_status","DMDMARTZ",
+               "AlcoholCategory","diabetes_status","hypertension_status","work_status")) {
+    ref[[fv]] <- factor(get_mode(df[[fv]]), levels = levels(df[[fv]]))
+  }
+  ref
+}
+
+# ==============================================================================
+# SECTION 6: Build RCS basis for all imputed datasets
+# ==============================================================================
+
+mi_rcs_datasets <- lapply(complete_list_scored, build_model_data,
+                          xvar = EXPOSURE_VAR, knots = knots_rcs)
+cat("Spline basis created for all imputed datasets.\n\n")
+
+# ==============================================================================
+# SECTION 7: Fit spline models across imputations
+# ==============================================================================
+
+cat("Fitting survey-weighted RCS models...\n")
+
+formula_m1 <- make_rcs_formula(OUTCOME_VAR, NULL)
+formula_m2 <- make_rcs_formula(OUTCOME_VAR, adj_demographic)
+formula_m3 <- make_rcs_formula(OUTCOME_VAR, adj_full_core)
+formula_m4 <- make_rcs_formula(OUTCOME_VAR, adj_full_plus)
+
+fit_m1_list <- lapply(mi_rcs_datasets, fit_rcs_on_dataset, formula_obj = formula_m1)
+fit_m2_list <- lapply(mi_rcs_datasets, fit_rcs_on_dataset, formula_obj = formula_m2)
+fit_m3_list <- lapply(mi_rcs_datasets, fit_rcs_on_dataset, formula_obj = formula_m3)
+fit_m4_list <- lapply(mi_rcs_datasets, fit_rcs_on_dataset, formula_obj = formula_m4)
+
+cat("Model fitting complete.\n\n")
+
+# ==============================================================================
+# SECTION 8: Pool coefficients and covariance matrices
+# ==============================================================================
+
+cat("Pooling across imputations...\n")
+pool_m1 <- pool_coef_vcov(fit_m1_list)
+pool_m2 <- pool_coef_vcov(fit_m2_list)
+pool_m3 <- pool_coef_vcov(fit_m3_list)
+pool_m4 <- pool_coef_vcov(fit_m4_list)
+cat("Pooling complete.\n\n")
+
+# ==============================================================================
+# SECTION 9: Wald tests — overall association and non-linearity
+# ==============================================================================
+
+spline_terms  <- c("rcs_lin", "rcs_nonlin1", "rcs_nonlin2")
+nonlin_terms  <- c("rcs_nonlin1", "rcs_nonlin2")
+model_labels  <- c("Model 1: Unadjusted",
+                   "Model 2: Demographic-adjusted",
+                   "Model 3: Lifestyle-adjusted",
+                   "Model 4: Fully adjusted")
+pool_list     <- list(pool_m1, pool_m2, pool_m3, pool_m4)
+
+overall_tests <- map2_dfr(pool_list, model_labels, function(p, lab) {
+  wald_test_terms(p$coef, p$vcov, spline_terms) %>% mutate(Model = lab)
+}) %>% mutate(P_label = sapply(p_value, fmt_p))
+
+nonlin_tests <- map2_dfr(pool_list, model_labels, function(p, lab) {
+  wald_test_terms(p$coef, p$vcov, nonlin_terms) %>% mutate(Model = lab)
+}) %>% mutate(P_label = sapply(p_value, fmt_p))
+
+cat("============================================================\n")
+cat("OVERALL ASSOCIATION TESTS (PHQ-9 >= 10)\n")
+cat("============================================================\n")
+print(overall_tests %>% select(Model, chisq, df, p_value, P_label))
+cat("\n")
+
+cat("============================================================\n")
+cat("NON-LINEARITY TESTS (PHQ-9 >= 10)\n")
+cat("============================================================\n")
+print(nonlin_tests %>% select(Model, chisq, df, p_value, P_label))
+cat("\n")
+
+# ==============================================================================
+# SECTION 10: Pooled spline predictions for Model 4
+# ==============================================================================
+
+baseline_row <- make_reference_row(mi_rcs_datasets[[1]])
+
+x_grid <- seq(
+  from       = quantile(mi_rcs_datasets[[1]][[EXPOSURE_VAR]], 0.01, na.rm = TRUE),
+  to         = quantile(mi_rcs_datasets[[1]][[EXPOSURE_VAR]], 0.99, na.rm = TRUE),
+  length.out = 300
+)
+
+plot_formula_m4 <- as.formula(
+  paste("~ rcs_lin + rcs_nonlin1 + rcs_nonlin2 +", adj_full_plus)
+)
+
+rcs_pred_m4 <- predict_pooled_rcs(
+  pool_obj          = pool_m4,
+  x_grid            = x_grid,
+  ref_value         = ref_value,
+  knots             = knots_rcs,
+  baseline_df       = baseline_row,
+  covariate_formula = plot_formula_m4
+)
+
+# ==============================================================================
+# SECTION 11: Nadir and risk-escalation point
+# ==============================================================================
+
+pred_data   <- arrange(rcs_pred_m4, x)
+nadir_row   <- pred_data %>% filter(OR == min(OR, na.rm = TRUE)) %>% slice(1)
+nadir_value <- nadir_row$x[1]
+
+risk_escalation_row <- pred_data %>%
+  filter(x > nadir_value, OR >= 1.10) %>%
+  slice(1)
+
+if (nrow(risk_escalation_row) > 0) {
+  risk_escalation_point <- risk_escalation_row$x[1]
+  cat("[Nadir Point]:", round(nadir_value, 4), "\n")
+  cat("[Risk-Escalation Point]: OR >= 1.10 at score =",
+      round(risk_escalation_point, 4), "\n\n")
+} else {
+  risk_escalation_point <- NA_real_
+  cat("No OR >= 1.10 detected after nadir.\n\n")
+}
+
+# ==============================================================================
+# SECTION 12: Secondary analysis — categorized exposure
+# ==============================================================================
+
+if (!is.na(risk_escalation_point)) {
+  
+  mi_cat_datasets <- lapply(complete_list_scored, function(df) {
+    df %>%
+      mutate(
+        RCS_Risk_Group = factor(
+          ifelse(sleep_timing_total_score >= risk_escalation_point, 1L, 0L),
+          levels = c(0L, 1L),
+          labels = c(
+            paste0("Lower Exposure (<",  round(risk_escalation_point, 2), ")"),
+            paste0("Higher Exposure (>=", round(risk_escalation_point, 2), ")")
+          )
+        )
+      )
+  })
+  
+  fit_cat_list <- lapply(mi_cat_datasets, function(df) {
+    des <- svydesign(id = ~SDMVPSU, strata = ~SDMVSTRA,
+                     weights = ~mec_adj, data = df, nest = TRUE)
+    svyglm(as.formula(paste(OUTCOME_VAR, "~ RCS_Risk_Group +", adj_full_plus)),
+           design = des, family = quasibinomial())
+  })
+  
+  pool_cat      <- MIcombine(fit_cat_list)
+  pool_cat_df   <- summary(pool_cat) %>% as.data.frame()
+  pool_cat_df$term <- rownames(pool_cat_df); rownames(pool_cat_df) <- NULL
+  
+  # Harmonise column names across mitools versions
+  if ("results"  %in% names(pool_cat_df)) pool_cat_df$estimate  <- pool_cat_df$results
+  if ("se"       %in% names(pool_cat_df)) pool_cat_df$std.error <- pool_cat_df$se
+  if ("(lower"   %in% names(pool_cat_df)) pool_cat_df$conf.low  <- pool_cat_df$`(lower`
+  if ("upper)"   %in% names(pool_cat_df)) pool_cat_df$conf.high <- pool_cat_df$`upper)`
+  
+  secondary_row <- pool_cat_df %>%
+    filter(str_detect(term, "RCS_Risk_Group")) %>%
+    mutate(OR  = exp(estimate),
+           LCI = exp(conf.low),
+           UCI = exp(conf.high))
+  
+  z_sec <- secondary_row$estimate / secondary_row$std.error
+  
+  secondary_summary <- tibble(
+    term     = secondary_row$term,
+    OR       = secondary_row$OR,
+    LCI      = secondary_row$LCI,
+    UCI      = secondary_row$UCI,
+    P_value  = 2 * pnorm(-abs(z_sec)),
+    CI_label = fmt_or(secondary_row$OR, secondary_row$LCI, secondary_row$UCI),
+    P_label  = fmt_p(2 * pnorm(-abs(z_sec)))
+  )
+  
+  cat("============================================================\n")
+  cat("SECONDARY ANALYSIS — RCS-DERIVED CATEGORIZED EXPOSURE\n")
+  cat("============================================================\n")
+  print(secondary_summary)
+  cat("\n")
+  
+} else {
+  secondary_summary <- NULL
+}
+
+# ==============================================================================
+# SECTION 13: Model stability check (first imputed dataset only)
+# ==============================================================================
+
+cat("============================================================\n")
+cat("VIF CHECK (FIRST IMPUTED DATASET)\n")
+cat("============================================================\n")
+
+vif_fit <- glm(
+  as.formula(paste(OUTCOME_VAR, "~", EXPOSURE_VAR, "+", adj_full_plus)),
+  data   = complete_list_scored[[1]],
+  family = binomial()
+)
+print(car::vif(vif_fit))
+cat("\n")
+
+# ==============================================================================
+# SECTION 14: P-value summary table
+# ==============================================================================
+
+pvalue_table <- overall_tests %>%
+  select(Model, p_value_overall = p_value, P_overall_label = P_label) %>%
+  left_join(
+    nonlin_tests %>% select(Model, p_value_nonlin = p_value, P_nonlin_label = P_label),
+    by = "Model"
+  )
+
+cat("============================================================\n")
+cat("P-VALUE SUMMARY TABLE (PHQ-9 >= 10)\n")
+cat("============================================================\n")
+print(pvalue_table)
+cat("\n")
+
+write.csv(pvalue_table,
+          file      = file.path(base_path, "Table_Pvalues_RCS_sensitivity_PHQ9_ge10.csv"),
+          row.names = FALSE)
+cat("P-value table saved.\n\n")
+
+if (requireNamespace("gt", quietly = TRUE)) {
+  library(gt)
+  pvalue_gt <- pvalue_table %>%
+    gt() %>%
+    tab_header(title = md("**Table S3. Overall and non-linearity tests — PHQ-9 sensitivity analysis (cutoff >= 10)**")) %>%
+    cols_label(Model           = "Model",
+               P_overall_label = "P for overall association",
+               P_nonlin_label  = "P for non-linearity") %>%
+    cols_hide(columns = c(p_value_overall, p_value_nonlin)) %>%
+    tab_options(table.font.names          = c("Times New Roman", "Arial", "Helvetica", "sans"),
+                table.font.size           = px(18),
+                column_labels.font.weight = "bold")
+  gtsave(pvalue_gt, file.path(base_path, "Table_S3_Pvalues_RCS_PHQ9_ge10.html"))
+  cat("Formatted HTML table saved.\n\n")
+}
+
+# ==============================================================================
+# SECTION 15: Publication-Ready Figure G
+#
+# Style mirrors Figure F exactly, with two changes:
+#   - Color:       #0072B2  (Okabe-Ito blue, distinct from F's green #009E73)
+#   - Panel label: G
+#
+# Export spec (identical to Figure F):
+#   TIFF: 600 dpi, LZW, 6.0 × 4.8 in, white background
+#   PDF:  cairo_pdf vector, 6.0 × 4.8 in
+#   PNG:  300 dpi, 6.0 × 4.8 in
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Visual constants  (only COL_LINE differs from Figure F)
+# ------------------------------------------------------------------------------
+COL_LINE_G <- "#0072B2"   # Okabe-Ito blue — colorblind-safe
+ALPHA_RIB  <- 0.16
+BASE_SIZE  <- 11
+FIG_W      <- 6.0
+FIG_H      <- 4.8
+
+# ------------------------------------------------------------------------------
+# Export helper (reusable)
+# ------------------------------------------------------------------------------
+export_figure <- function(plot_obj, stem) {
+  
+  path_tiff <- file.path(out_dir, paste0(stem, ".tiff"))
+  path_png  <- file.path(out_dir, paste0(stem, ".png"))
+  path_pdf  <- file.path(out_dir, paste0(stem, ".pdf"))
+  
+  ggsave(path_tiff, plot = plot_obj, device = "tiff",
+         dpi = 600, width = FIG_W, height = FIG_H,
+         units = "in", compression = "lzw", bg = "white")
+  
+  ggsave(path_png,  plot = plot_obj, device = "png",
+         dpi = 300, width = FIG_W, height = FIG_H,
+         units = "in", bg = "white")
+  
+  ggsave(path_pdf,  plot = plot_obj, device = cairo_pdf,
+         width = FIG_W, height = FIG_H, units = "in", bg = "white")
+  
+  message(sprintf("[OK] TIFF : %s", path_tiff))
+  message(sprintf("[OK] PNG  : %s", path_png))
+  message(sprintf("[OK] PDF  : %s", path_pdf))
+}
+
+# ------------------------------------------------------------------------------
+# Core figure constructor (parameterised color + label)
+# ------------------------------------------------------------------------------
+make_rcs_figure <- function(pred_df,
+                            panel_label,
+                            p_overall,
+                            p_nonlin,
+                            col_line     = "#0072B2",
+                            show_overall = FALSE) {
+  
+  p_nonlin_txt <- paste0("P for nonlinearity ", fmt_p_fig(p_nonlin))
+  p_ann_label  <- if (show_overall) {
+    paste0("P for overall association ", fmt_p_fig(p_overall), "\n", p_nonlin_txt)
+  } else {
+    p_nonlin_txt
+  }
+  
+  y_min_raw <- min(pred_df$LCI, na.rm = TRUE)
+  y_max_raw <- max(pred_df$UCI, na.rm = TRUE)
+  y_min_r   <- floor(y_min_raw   * 10) / 10
+  y_max_r   <- ceiling(y_max_raw * 10) / 10
+  y_range   <- max(y_max_r - y_min_r, 0.5)
+  y_pad     <- max(0.04, y_range * 0.06)
+  
+  x_min <- min(pred_df$x, na.rm = TRUE)
+  x_max <- max(pred_df$x, na.rm = TRUE)
+  
+  ggplot(pred_df, aes(x = x, y = OR)) +
+    
+    # Confidence ribbon
+    geom_ribbon(aes(ymin = LCI, ymax = UCI),
+                fill   = col_line,
+                alpha  = ALPHA_RIB,
+                colour = NA) +
+    
+    # Spline line
+    geom_line(colour = col_line, linewidth = 1.15) +
+    
+    # Reference line at OR = 1
+    geom_hline(yintercept = 1,
+               linetype   = "dashed",
+               colour     = "grey35",
+               linewidth  = 0.6) +
+    
+    # Panel label (bold, top-left)
+    annotate("text",
+             x        = x_min + 0.03 * (x_max - x_min),
+             y        = y_max_r + y_pad * 0.72,
+             label    = panel_label,
+             hjust    = 0, vjust = 1,
+             family   = "sans", fontface = "bold",
+             size     = 5, colour = "black") +
+    
+    # P-value annotation (top-right)
+    annotate("text",
+             x          = x_max - 0.02 * (x_max - x_min),
+             y          = y_max_r + y_pad * 0.10,
+             label      = p_ann_label,
+             hjust      = 1, vjust = 1,
+             family     = "sans", fontface = "plain",
+             size       = 3.5, colour = "black",
+             lineheight = 1.2) +
+    
+    scale_x_continuous(
+      name   = "Cumulative circadian misalignment score (higher = greater misalignment)",
+      expand = expansion(mult = c(0.01, 0.01))
+    ) +
+    scale_y_continuous(
+      name   = "Adjusted odds ratio (95% CI)",
+      limits = c(y_min_r - y_pad, y_max_r + y_pad),
+      expand = expansion(mult = c(0, 0))
+    ) +
+    labs(title = NULL, subtitle = NULL, caption = NULL) +
+    
+    theme_bw(base_size = BASE_SIZE, base_family = "sans") +
+    theme(
+      panel.grid.major  = element_blank(),
+      panel.grid.minor  = element_blank(),
+      panel.border      = element_rect(colour = "black", linewidth = 0.7, fill = NA),
+      axis.title        = element_text(face = "bold", colour = "black", size = BASE_SIZE),
+      axis.text         = element_text(colour = "black", size = BASE_SIZE * 0.9),
+      axis.ticks        = element_line(colour = "black", linewidth = 0.4),
+      axis.ticks.length = unit(2.5, "pt"),
+      plot.title        = element_blank(),
+      plot.subtitle     = element_blank(),
+      plot.caption      = element_blank(),
+      legend.position   = "none",
+      plot.margin       = margin(t = 10, r = 10, b = 8, l = 8)
+    )
+}
+
+# ------------------------------------------------------------------------------
+# Build Figure G — Model 4, PHQ-9 >= 10, Okabe-Ito blue
+# ------------------------------------------------------------------------------
+pv_m4_g <- list(
+  p_overall = overall_tests %>%
+    filter(Model == "Model 4: Fully adjusted") %>% pull(p_value),
+  p_nonlin  = nonlin_tests  %>%
+    filter(Model == "Model 4: Fully adjusted") %>% pull(p_value)
+)
+
+fig_G <- make_rcs_figure(
+  pred_df      = rcs_pred_m4,
+  panel_label  = "G",
+  p_overall    = pv_m4_g$p_overall,
+  p_nonlin     = pv_m4_g$p_nonlin,
+  col_line     = COL_LINE_G,
+  show_overall = FALSE
+)
+
+# Export
+export_figure(fig_G, "Supplementary_Figure_G_RCS_FullyAdjusted_PHQ9ge10")
+print(fig_G)
+
+# ==============================================================================
+# SECTION 16: Key result text for manuscript
+# ==============================================================================
+
+cat("\n===== KEY RESULT (Model 4 — PHQ-9 >= 10, Supplementary Figure G) =====\n")
+cat("P-overall     =", fmt_p(pv_m4_g$p_overall), "\n")
+cat("P-nonlinearity=", fmt_p(pv_m4_g$p_nonlin),  "\n\n")
+
+# ==============================================================================
+# SECTION 17: Store objects in memory
+# ==============================================================================
+
+analysis_objects_rcs_phq9_ge10 <- list(
+  knots_rcs             = knots_rcs,
+  ref_value             = ref_value,
+  fit_m1_list           = fit_m1_list,
+  fit_m2_list           = fit_m2_list,
+  fit_m3_list           = fit_m3_list,
+  fit_m4_list           = fit_m4_list,
+  pool_m1               = pool_m1,
+  pool_m2               = pool_m2,
+  pool_m3               = pool_m3,
+  pool_m4               = pool_m4,
+  overall_tests         = overall_tests,
+  nonlin_tests          = nonlin_tests,
+  rcs_pred_m4           = rcs_pred_m4,
+  nadir_value           = nadir_value,
+  risk_escalation_point = risk_escalation_point,
+  secondary_summary     = secondary_summary,
+  plot_object_G         = fig_G
+)
+
+message("============================================================")
+message("Supplementary Figure G exported to: ", out_dir)
+message("Files produced:")
+message("  Supplementary_Figure_G_RCS_FullyAdjusted_PHQ9ge10.tiff")
+message("  Supplementary_Figure_G_RCS_FullyAdjusted_PHQ9ge10.pdf")
+message("  Supplementary_Figure_G_RCS_FullyAdjusted_PHQ9ge10.png")
+message("  Table_Pvalues_RCS_sensitivity_PHQ9_ge10.csv")
+message("============================================================")
+message("RCS SENSITIVITY ANALYSIS COMPLETED SUCCESSFULLY: PHQ-9 >= 10 (Panel G)")
