@@ -1,0 +1,500 @@
+################################################################################
+# SCRIPT 1: Construction of multidimensional sleep timing deviation scores
+# PURPOSE: Generate literature-informed component scores and total score
+# DESIGN: Variable construction only; no regression analysis is performed here
+#
+# NOTES FOR ACADEMIC REPORTING:
+# - This script is restricted to score derivation.
+# - The generated scores can be used in subsequent descriptive and regression
+#   analyses.
+# - The scoring framework is intended for supplementary/sensitivity analyses.
+# - Results are displayed in the console and simultaneously written to a log file.
+################################################################################
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+})
+
+# ==============================================================================
+# SECTION 0: Working directory, paths, and log output
+# ==============================================================================
+
+base_path <- "D:/code"
+setwd(base_path)
+
+input_file  <- "12.PHQ8_imputed_datasets_list.rds"
+output_file <- "13.PHQ8_MI_scored_datasets_list_v2.rds"
+
+reference_table_file <- "Table_PHQ8_reference_intervals_v2.csv"
+scoring_rule_file    <- "Table_PHQ8_scoring_rules_v2.csv"
+log_file             <- "01_build_multidimensional_sleep_timing_score_log.txt"
+
+if (file.exists(log_file)) file.remove(log_file)
+sink(log_file, split = TRUE)
+
+cat("============================================================\n")
+cat("SCRIPT 1 STARTED: Construction of multidimensional scores\n")
+cat("Working directory:", base_path, "\n")
+cat("============================================================\n\n")
+
+# ==============================================================================
+# SECTION 1: Load multiply-imputed datasets
+# ==============================================================================
+
+cat("Loading multiply-imputed datasets...\n")
+complete_list <- readRDS(input_file)
+
+cat("Number of imputed datasets:", length(complete_list), "\n")
+cat("Sample size per dataset   :", nrow(complete_list[[1]]), "\n\n")
+
+# ==============================================================================
+# SECTION 2: Define literature-informed reference intervals
+# ------------------------------------------------------------------------------
+# Time scale: decimal hours on a 24-hour clock, from 0 to <24.
+# These intervals are used only for score construction.
+# ==============================================================================
+
+reference_intervals <- tibble::tribble(
+  ~metric_name,              ~ref_low,         ~ref_high,
+  
+  # Sleep onset
+  "sleep_onset_weekday",     22 + 57/60,       23 + 17/60,  # 22:57-23:17
+  "sleep_onset_weekend",     23 + 21/60,       23 + 35/60,  # 23:21-23:35
+  
+  # Wake time
+  "wake_time_weekday",        6 + 36/60,        6 + 45/60,  # 06:36-06:45
+  "wake_time_weekend",        7 + 37/60,        7 + 46/60,  # 07:37-07:46
+  
+  # Sleep midpoint
+  "sleep_midpoint_weekday",   2 + 47/60,        3 +  1/60,  # 02:47-03:01
+  "sleep_midpoint_weekend",   3 + 29/60,        3 + 40/60   # 03:29-03:40
+)
+
+# ==============================================================================
+# SECTION 3: Utility functions
+# ==============================================================================
+
+hour_to_hhmm <- function(x) {
+  if (is.na(x)) return(NA_character_)
+  
+  h <- floor(x)
+  m <- round((x - h) * 60)
+  
+  if (m == 60) {
+    h <- h + 1
+    m <- 0
+  }
+  
+  h <- h %% 24
+  sprintf("%02d:%02d", h, m)
+}
+
+circular_diff <- function(x, y, period = 24) {
+  raw_diff <- abs(x - y)
+  pmin(raw_diff, period - raw_diff)
+}
+
+score_timing <- function(x, ref_low, ref_high) {
+  if (is.na(x)) return(NA_integer_)
+  
+  if (ref_low <= ref_high) {
+    in_interval <- (x >= ref_low & x <= ref_high)
+    if (in_interval) return(0L)
+    
+    d1 <- circular_diff(x, ref_low)
+    d2 <- circular_diff(x, ref_high)
+    dist_to_interval <- min(d1, d2)
+    
+  } else {
+    # Wrap-around interval retained for robustness
+    in_interval <- (x >= ref_low & x < 24) | (x >= 0 & x <= ref_high)
+    if (in_interval) return(0L)
+    
+    d1 <- circular_diff(x, ref_low)
+    d2 <- circular_diff(x, ref_high)
+    dist_to_interval <- min(d1, d2)
+  }
+  
+  if (dist_to_interval <= 1) {
+    return(1L)
+  } else if (dist_to_interval <= 2) {
+    return(2L)
+  } else {
+    return(3L)
+  }
+}
+
+get_ref <- function(ref_tbl, metric_name_input) {
+  row <- ref_tbl %>% filter(metric_name == metric_name_input)
+  
+  if (nrow(row) != 1) {
+    stop("Reference interval lookup failed for: ", metric_name_input)
+  }
+  
+  list(low = row$ref_low[[1]], high = row$ref_high[[1]])
+}
+
+group_total_score <- function(x) {
+  case_when(
+    x >= 0  & x <= 3  ~ "0-3",
+    x >= 4  & x <= 6  ~ "4-6",
+    x >= 7  & x <= 9  ~ "7-9",
+    x >= 10 & x <= 12 ~ "10-12",
+    x >= 13           ~ "13+",
+    TRUE              ~ NA_character_
+  )
+}
+
+apply_sleep_timing_scores <- function(dat, ref_tbl) {
+  
+  ref_onset_wd <- get_ref(ref_tbl, "sleep_onset_weekday")
+  ref_onset_we <- get_ref(ref_tbl, "sleep_onset_weekend")
+  ref_wake_wd  <- get_ref(ref_tbl, "wake_time_weekday")
+  ref_wake_we  <- get_ref(ref_tbl, "wake_time_weekend")
+  ref_mid_wd   <- get_ref(ref_tbl, "sleep_midpoint_weekday")
+  ref_mid_we   <- get_ref(ref_tbl, "sleep_midpoint_weekend")
+  
+  dat %>%
+    mutate(
+      score_sleep_onset_weekday = vapply(
+        sleep_onset_weekday_hours, score_timing, integer(1),
+        ref_low = ref_onset_wd$low, ref_high = ref_onset_wd$high
+      ),
+      score_sleep_onset_weekend = vapply(
+        sleep_onset_weekend_hours, score_timing, integer(1),
+        ref_low = ref_onset_we$low, ref_high = ref_onset_we$high
+      ),
+      score_wake_time_weekday = vapply(
+        wake_time_weekday_hours, score_timing, integer(1),
+        ref_low = ref_wake_wd$low, ref_high = ref_wake_wd$high
+      ),
+      score_wake_time_weekend = vapply(
+        wake_time_weekend_hours, score_timing, integer(1),
+        ref_low = ref_wake_we$low, ref_high = ref_wake_we$high
+      ),
+      score_midpoint_weekday = vapply(
+        sleep_midpoint_weekday_hours, score_timing, integer(1),
+        ref_low = ref_mid_wd$low, ref_high = ref_mid_wd$high
+      ),
+      score_midpoint_weekend = vapply(
+        sleep_midpoint_weekend_hours, score_timing, integer(1),
+        ref_low = ref_mid_we$low, ref_high = ref_mid_we$high
+      ),
+      sleep_timing_total_score =
+        score_sleep_onset_weekday +
+        score_sleep_onset_weekend +
+        score_wake_time_weekday +
+        score_wake_time_weekend +
+        score_midpoint_weekday +
+        score_midpoint_weekend,
+      sleep_timing_total_group = factor(
+        group_total_score(sleep_timing_total_score),
+        levels = c("0-3", "4-6", "7-9", "10-12", "13+")
+      )
+    )
+}
+
+# ==============================================================================
+# SECTION 4: Apply score construction to all imputed datasets
+# ==============================================================================
+
+cat("Constructing multidimensional sleep timing scores...\n\n")
+
+complete_list_scored <- lapply(seq_along(complete_list), function(i) {
+  cat("Processing imputed dataset", i, "of", length(complete_list), "...\n")
+  
+  dat_scored <- complete_list[[i]] %>%
+    apply_sleep_timing_scores(reference_intervals) %>%
+    mutate(
+      sleep_timing_total_score_z = as.numeric(scale(sleep_timing_total_score))
+    )
+  
+  return(dat_scored)
+})
+
+cat("\nScore construction completed for all imputed datasets.\n\n")
+
+# ==============================================================================
+# SECTION 5: Basic distribution checks
+# ==============================================================================
+
+cat("===== Distribution of total score in imputed dataset 1 =====\n")
+print(table(complete_list_scored[[1]]$sleep_timing_total_score, useNA = "ifany"))
+cat("\n")
+
+cat("===== Distribution of grouped total score in imputed dataset 1 =====\n")
+print(table(complete_list_scored[[1]]$sleep_timing_total_group, useNA = "ifany"))
+cat("\n")
+
+cat("===== Preview of scored variables in imputed dataset 1 =====\n")
+preview_cols <- c(
+  "score_sleep_onset_weekday",
+  "score_sleep_onset_weekend",
+  "score_wake_time_weekday",
+  "score_wake_time_weekend",
+  "score_midpoint_weekday",
+  "score_midpoint_weekend",
+  "sleep_timing_total_score",
+  "sleep_timing_total_group",
+  "sleep_timing_total_score_z"
+)
+
+print(head(complete_list_scored[[1]][, preview_cols], 10))
+cat("\n")
+
+# ==============================================================================
+# SECTION 6: Create reference and scoring rule tables
+# ==============================================================================
+
+reference_table <- reference_intervals %>%
+  mutate(
+    ref_low_hhmm = vapply(ref_low, hour_to_hhmm, character(1)),
+    ref_high_hhmm = vapply(ref_high, hour_to_hhmm, character(1)),
+    reference_interval = paste0(ref_low_hhmm, "–", ref_high_hhmm)
+  ) %>%
+  select(metric_name, reference_interval)
+
+scoring_rule_table <- tibble(
+  Score = c(0, 1, 2, 3),
+  Definition = c(
+    "Within reference interval",
+    "≤1 h outside reference interval",
+    "1–2 h outside reference interval",
+    ">2 h outside reference interval"
+  )
+)
+
+cat("===== Reference interval table =====\n")
+print(reference_table)
+cat("\n")
+
+cat("===== Scoring rule table =====\n")
+print(scoring_rule_table)
+cat("\n")
+
+# ==============================================================================
+# SECTION 7: Save outputs
+# ==============================================================================
+
+write.csv(reference_table, reference_table_file, row.names = FALSE)
+write.csv(scoring_rule_table, scoring_rule_file, row.names = FALSE)
+saveRDS(complete_list_scored, output_file)
+
+cat("Reference interval table saved to: ", reference_table_file, "\n", sep = "")
+cat("Scoring rule table saved to: ", scoring_rule_file, "\n", sep = "")
+cat("Scored datasets saved to: ", output_file, "\n\n", sep = "")
+
+# ==============================================================================
+# SECTION 8: Session information
+# ==============================================================================
+
+cat("===== Session information =====\n")
+print(sessionInfo())
+cat("\n")
+
+cat("============================================================\n")
+cat("[COMPLETE] Script 1 finished successfully.\n")
+cat("Log file saved to: ", log_file, "\n", sep = "")
+cat("============================================================\n")
+
+sink()
+
+# ==============================================================================
+# SUPPLEMENTARY TABLE S1 (Sensitivity Analysis)
+# Title: Score categories for sleep timing metrics
+#        (cumulative intervals: each score band INCLUDES all lower score bands)
+#
+# Scoring logic:
+#   Score 0: within reference interval                   [ref_lo,       ref_hi      ]
+#   Score 1: ref interval ± 1 h  (includes Score 0)     [ref_lo - 1,   ref_hi + 1  ]
+#   Score 2: ref interval ± 2 h  (includes Score 1)     [ref_lo - 2,   ref_hi + 2  ]
+#   Score 3: ref interval ± 3 h  (includes Score 2)     [ref_lo - 3,   ref_hi + 3  ]
+#
+# Intervals that cross midnight are displayed as two segments:
+#   "hh:mm–23:59 / 00:00–hh:mm"
+#
+# Add this block at the END of Script 1, after sink() is called.
+# Dependencies: flextable, officer, dplyr
+# Output:
+#   D:/code/table/Sensitivity_Table_S1_SleepTimingScores.docx
+#   D:/code/table/Sensitivity_Table_S1_SleepTimingScores.html
+# ==============================================================================
+
+library(flextable)
+library(officer)
+library(dplyr)
+
+# ------------------------------------------------------------------------------
+# 1. Helper functions
+# ------------------------------------------------------------------------------
+
+# Convert decimal hours to "hh:mm" on a 24-h clock
+h2hm <- function(x) {
+  x <- ((x %% 24) + 24) %% 24
+  h <- floor(x)
+  m <- round((x - h) * 60)
+  if (!is.na(m) && m == 60) { h <- (h + 1L) %% 24L; m <- 0L }
+  sprintf("%02d:%02d", h, m)
+}
+
+# Cumulative interval label for score s:
+#   full range = [ref_lo - s,  ref_hi + s]
+#   wraps midnight → "lo–23:59 / 00:00–hi"
+#   no wrap       → "lo–hi"
+cum_interval <- function(ref_lo, ref_hi, s) {
+  lo <- ref_lo - s
+  hi <- ref_hi + s
+  if (lo < 0 || hi >= 24) {
+    paste0(h2hm(lo), "\u201323:59 / 00:00\u2013", h2hm(hi))
+  } else {
+    paste0(h2hm(lo), "\u2013", h2hm(hi))
+  }
+}
+
+nadir_hm <- function(ref_lo, ref_hi) h2hm((ref_lo + ref_hi) / 2)
+
+make_row <- function(metric, daytype, ref_lo, ref_hi) {
+  data.frame(
+    metric  = metric,
+    daytype = daytype,
+    s0      = cum_interval(ref_lo, ref_hi, 0),
+    s1      = cum_interval(ref_lo, ref_hi, 1),
+    s2      = cum_interval(ref_lo, ref_hi, 2),
+    s3      = cum_interval(ref_lo, ref_hi, 3),
+    nadir   = nadir_hm(ref_lo, ref_hi),
+    stringsAsFactors = FALSE
+  )
+}
+
+# ------------------------------------------------------------------------------
+# 2. Reference intervals  (Section 2 of Script 1)
+# ------------------------------------------------------------------------------
+tbl <- bind_rows(
+  make_row("Sleep Onset",    "Weekday", 22 + 57/60, 23 + 17/60),
+  make_row("Sleep Onset",    "Weekend", 23 + 21/60, 23 + 35/60),
+  make_row("Sleep Midpoint", "Weekday",  2 + 47/60,  3 +  1/60),
+  make_row("Sleep Midpoint", "Weekend",  3 + 29/60,  3 + 40/60),
+  make_row("Wake-up Time",   "Weekday",  6 + 36/60,  6 + 45/60),
+  make_row("Wake-up Time",   "Weekend",  7 + 37/60,  7 + 46/60)
+)
+
+colnames(tbl) <- c(
+  "Timing\nMetric", "Day\nType",
+  "Score 0", "Score 1", "Score 2", "Score 3",
+  "Nadir\n(hh:mm)"
+)
+
+# ------------------------------------------------------------------------------
+# 3. Colour palette
+# ------------------------------------------------------------------------------
+NAVY  <- "#1F3864"
+LIGHT <- "#EAF2FB"   # Sleep Midpoint rows
+WHITE <- "#FFFFFF"
+
+# ------------------------------------------------------------------------------
+# 4. Build flextable
+# ------------------------------------------------------------------------------
+ft <- flextable(tbl) %>%
+  
+  font(fontname = "Times New Roman", part = "all") %>%
+  fontsize(size = 10, part = "header") %>%
+  fontsize(size = 10, part = "body") %>%
+  
+  bold(part = "header") %>%
+  bg(bg = NAVY, part = "header") %>%
+  color(color = "white", part = "header") %>%
+  align(align = "center", part = "header") %>%
+  valign(valign = "bottom", part = "header") %>%
+  
+  # Timing Metric: vertically merged pairs, bold, left-aligned
+  merge_v(j = 1) %>%
+  valign(j = 1, valign = "center", part = "body") %>%
+  bold(j = 1, part = "body") %>%
+  align(j = 1, align = "left", part = "body") %>%
+  
+  align(j = 2, align = "left",   part = "body") %>%
+  align(j = 3:6, align = "center", part = "body") %>%
+  
+  bold(j = 7, part = "body") %>%
+  color(j = 7, color = NAVY, part = "body") %>%
+  align(j = 7, align = "center", part = "body") %>%
+  
+  bg(i = 1:2, bg = WHITE, part = "body") %>%
+  bg(i = 3:4, bg = LIGHT, part = "body") %>%
+  bg(i = 5:6, bg = WHITE, part = "body") %>%
+  
+  width(j = 1, width = 1.15) %>%
+  width(j = 2, width = 0.80) %>%
+  width(j = 3, width = 1.25) %>%
+  width(j = 4, width = 1.55) %>%
+  width(j = 5, width = 1.55) %>%
+  width(j = 6, width = 1.55) %>%
+  width(j = 7, width = 0.85) %>%
+  
+  border_remove() %>%
+  hline_top(border    = fp_border(color = NAVY, width = 2.0), part = "header") %>%
+  hline_bottom(border = fp_border(color = NAVY, width = 1.5), part = "header") %>%
+  hline_bottom(border = fp_border(color = NAVY, width = 1.5), part = "body") %>%
+  hline(i = 2, border = fp_border(color = "#7F9FB6", width = 0.9), part = "body") %>%
+  hline(i = 4, border = fp_border(color = "#7F9FB6", width = 0.9), part = "body") %>%
+  hline(i = c(1, 3, 5),
+        border = fp_border(color = "#C8D8E8", width = 0.4), part = "body") %>%
+  
+  padding(padding.top  = 7, padding.bottom = 7,
+          padding.left = 9, padding.right  = 9, part = "all") %>%
+  height(height = 0.44, part = "body") %>%
+  hrule(rule = "atleast", part = "body") %>%
+  line_spacing(space = 1.05, part = "body") %>%
+  
+  set_table_properties(layout = "fixed") %>%
+  fix_border_issues()
+
+ft <- add_footer_lines(ft, values = c(
+  paste0("Abbreviations: hh:mm, hours:minutes (24-hour clock, midnight = 00:00); ",
+         "e.g., 22:05 corresponds to 10:05 PM."),
+  paste0("Reference intervals: Literature-derived normative timing windows for each ",
+         "sleep metric on weekdays and weekends."),
+  paste0("Scoring logic: Each score band is the cumulative expansion of the reference ",
+         "interval and fully contains all lower score bands \u2014 ",
+         "Score 0: reference interval (ref \u00b1 0 h); ",
+         "Score 1: reference interval \u00b1 1 h (contains Score 0); ",
+         "Score 2: reference interval \u00b1 2 h (contains Score 1); ",
+         "Score 3: reference interval \u00b1 3 h (contains Score 2)."),
+  paste0("Intervals crossing midnight are shown as two segments: ",
+         "\"hh:mm\u201323:59 / 00:00\u2013hh:mm\"."),
+  paste0("Nadir: midpoint of the reference interval (minimum deviation point). ",
+         "Component scores are summed across all six dimensions to produce the ",
+         "cumulative circadian misalignment (CMB) score (range 0\u201318); ",
+         "higher scores indicate greater deviation from normative sleep timing.")
+)) %>%
+  font(fontname = "Times New Roman", part = "footer") %>%
+  fontsize(size = 8.5, part = "footer") %>%
+  color(color = "#444444", part = "footer") %>%
+  italic(part = "footer") %>%
+  line_spacing(space = 1.25, part = "footer")
+
+# ------------------------------------------------------------------------------
+# 5. Export
+# ------------------------------------------------------------------------------
+out_dir <- "D:/code/table"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+doc <- read_docx() %>%
+  body_add_par(
+    paste0("Table S1 (Sensitivity Analysis). ",
+           "Score categories for sleep timing metrics: ",
+           "cumulative reference intervals by score level"),
+    style = "heading 3"
+  ) %>%
+  body_add_flextable(ft) %>%
+  body_add_par("", style = "Normal")
+
+print(doc,
+      target = file.path(out_dir, "Sensitivity_Table_S1_SleepTimingScores.docx"))
+save_as_html(ft,
+             path = file.path(out_dir, "Sensitivity_Table_S1_SleepTimingScores.html"))
+
+message("[OK] ", file.path(out_dir, "Sensitivity_Table_S1_SleepTimingScores.docx"))
+message("[OK] ", file.path(out_dir, "Sensitivity_Table_S1_SleepTimingScores.html"))
+message("[DONE] Sensitivity Table S1 complete.")
+print(ft)
