@@ -1,0 +1,1032 @@
+################################################################################
+# SENSITIVITY ANALYSIS SCRIPT:
+# Association between cumulative circadian misalignment score and depression
+# using PHQ-8 >= 9 as the outcome definition
+#
+# PURPOSE:
+# - Evaluate the association between cumulative circadian misalignment score
+#   and depression status using survey-weighted logistic regression with
+#   multiply imputed data
+# - Use PHQ-8 >= 9 as an alternative outcome definition for sensitivity analysis
+# - Display key results directly in the console
+# - Generate one forest plot aligned to the main analysis layout
+#
+# REPORTING NOTES:
+# - This script is intended for observational, cross-sectional analysis.
+# - Output wording avoids causal interpretation.
+# - Findings should be described as associations or differences in odds.
+################################################################################
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(survey)
+  library(mitools)
+  library(ggplot2)
+})
+
+options(survey.lonely.psu = "adjust")
+
+# ==============================================================================
+# SECTION 0: Paths
+# ==============================================================================
+
+base_path <- "D:/code"
+setwd(base_path)
+
+input_file <- "13.PHQ8_MI_scored_datasets_list_v2.rds"
+
+output_plot_png <- "Figure_sensitivity_analysis_PHQ8_ge9_pooledP.png"
+output_plot_pdf <- "Figure_sensitivity_analysis_PHQ8_ge9_pooledP.pdf"
+
+cat("============================================================\n")
+cat("SENSITIVITY ANALYSIS STARTED: PHQ-8 >= 9\n")
+cat("============================================================\n\n")
+
+# ==============================================================================
+# SECTION 1: Load multiply imputed datasets
+# ==============================================================================
+
+complete_list_scored <- readRDS(input_file)
+
+cat("Multiply imputed datasets loaded.\n")
+cat("Number of imputations:", length(complete_list_scored), "\n")
+cat("Sample size per dataset:", nrow(complete_list_scored[[1]]), "\n\n")
+
+# ==============================================================================
+# SECTION 2: Ensure PHQ-8 >= 9 outcome exists and redefine grouped score
+# New categories: 0-4, 5-7, 8-10, 11-13, 14+
+# ==============================================================================
+
+complete_list_scored <- lapply(complete_list_scored, function(df) {
+  
+  if (!"PHQ8_depression_above_9" %in% names(df)) {
+    if (!"PHQ8_SCORE" %in% names(df)) {
+      stop("Neither PHQ8_depression_above_9 nor PHQ8_SCORE was found in the dataset.")
+    }
+    
+    df <- df %>%
+      mutate(
+        PHQ8_depression_above_9 = case_when(
+          PHQ8_SCORE >= 9 ~ 1,
+          PHQ8_SCORE < 9  ~ 0,
+          TRUE ~ NA_real_
+        )
+      )
+  }
+  
+  if (!"PHQ8_depression_above_10" %in% names(df) && "PHQ8_SCORE" %in% names(df)) {
+    df <- df %>%
+      mutate(
+        PHQ8_depression_above_10 = case_when(
+          PHQ8_SCORE >= 10 ~ 1,
+          PHQ8_SCORE < 10  ~ 0,
+          TRUE ~ NA_real_
+        )
+      )
+  }
+  
+  df %>%
+    mutate(
+      sleep_timing_total_group = cut(
+        sleep_timing_total_score,
+        breaks = c(-Inf, 4, 7, 10, 13, Inf),
+        labels = c("0-4", "5-7", "8-10", "11-13", "14+"),
+        right = TRUE
+      ),
+      sleep_timing_total_group = factor(
+        sleep_timing_total_group,
+        levels = c("0-4", "5-7", "8-10", "11-13", "14+")
+      )
+    )
+})
+
+cat("Outcome confirmed as PHQ-8 >= 9.\n")
+cat("Grouped score redefined as: 0-4, 5-7, 8-10, 11-13, 14+\n\n")
+
+# ==============================================================================
+# SECTION 3: Build survey-weighted imputation design
+# ==============================================================================
+
+imp_list_scored <- imputationList(complete_list_scored)
+
+design_mi_scored <- svydesign(
+  id = ~SDMVPSU,
+  strata = ~SDMVSTRA,
+  weights = ~mec_adj,
+  data = imp_list_scored,
+  nest = TRUE
+)
+
+cat("Survey-weighted multiply imputed design created.\n\n")
+
+# ==============================================================================
+# SECTION 4: Model specifications
+# ==============================================================================
+
+OUTCOME_VAR <- "PHQ8_depression_above_9"
+
+adj_demographic <- "RIDAGEYR + RIAGENDR + RIDRETH1"
+
+adj_full_core <- paste(
+  "RIDAGEYR + RIAGENDR + RIDRETH1 +",
+  "DMDEDUC2 + smoke_status + DMDMARTZ + BMI_value + AlcoholCategory +",
+  "diabetes_status + hypertension_status + work_status + MET_total + INDFMPIR"
+)
+
+adj_full_plus <- paste(adj_full_core, "+ sedentary_min")
+
+make_formula <- function(exposure, covariates = NULL) {
+  rhs <- if (is.null(covariates)) exposure else paste(exposure, "+", covariates)
+  as.formula(paste(OUTCOME_VAR, "~", rhs))
+}
+
+# ==============================================================================
+# SECTION 5: Helper functions
+# ==============================================================================
+
+get_pool_df <- function(mi_obj) {
+  sm <- summary(mi_obj)
+  out <- as.data.frame(sm)
+  out$term <- rownames(out)
+  rownames(out) <- NULL
+  
+  if ("results" %in% names(out)) out$estimate <- out$results
+  if ("se" %in% names(out)) out$std.error <- out$se
+  if ("(lower" %in% names(out)) out$conf.low <- out$`(lower`
+  if ("upper)" %in% names(out)) out$conf.high <- out$`upper)`
+  
+  out
+}
+
+extract_one_term <- function(mi_obj, term_name, label) {
+  out <- get_pool_df(mi_obj)
+  row <- out %>% filter(term == term_name)
+  
+  if (nrow(row) != 1) {
+    stop("Target term not found: ", term_name)
+  }
+  
+  tibble(
+    Model = label,
+    beta = row$estimate,
+    se = row$std.error,
+    OR = exp(row$estimate),
+    LCI = exp(row$conf.low),
+    UCI = exp(row$conf.high)
+  )
+}
+
+extract_pattern_terms <- function(mi_obj, exposure_pattern) {
+  out <- get_pool_df(mi_obj)
+  
+  out %>%
+    filter(str_detect(term, exposure_pattern)) %>%
+    mutate(
+      OR = exp(estimate),
+      LCI = exp(conf.low),
+      UCI = exp(conf.high)
+    ) %>%
+    select(term, estimate, std.error, conf.low, conf.high, OR, LCI, UCI, missInfo)
+}
+
+fmt_or <- function(or, lci, uci, digits = 2) {
+  sprintf(
+    paste0("%.", digits, "f (%.", digits, "f-%.", digits, "f)"),
+    or, lci, uci
+  )
+}
+
+fmt_p <- function(p) {
+  if (is.na(p)) return(NA_character_)
+  if (p < 0.001) return("<.001")
+  sprintf("%.3f", p)
+}
+
+# More rigorous pooled P-value display:
+# derive a two-sided Wald P-value directly from pooled estimate and pooled SE
+# This aligns the displayed P-value with the MI-pooled OR and CI.
+extract_pooled_term <- function(mi_obj, term_name, label) {
+  out <- get_pool_df(mi_obj)
+  row <- out %>% filter(term == term_name)
+  
+  if (nrow(row) != 1) {
+    stop("Target term not found in pooled model output: ", term_name)
+  }
+  
+  z_val <- row$estimate / row$std.error
+  p_val <- 2 * pnorm(-abs(z_val))
+  
+  tibble(
+    Model = label,
+    estimate = row$estimate,
+    se = row$std.error,
+    OR = exp(row$estimate),
+    LCI = exp(row$conf.low),
+    UCI = exp(row$conf.high),
+    P_val = p_val,
+    P_label = fmt_p(p_val)
+  )
+}
+
+# ==============================================================================
+# SECTION 6: Fit sensitivity-analysis models
+# ==============================================================================
+
+cat("Fitting sensitivity-analysis models...\n")
+
+fit_cat_m4 <- with(
+  design_mi_scored,
+  svyglm(
+    make_formula("relevel(sleep_timing_total_group, ref = '0-4')", adj_full_plus),
+    family = quasibinomial()
+  )
+)
+
+fit_trend_m1 <- with(
+  design_mi_scored,
+  svyglm(
+    make_formula("sleep_timing_total_score"),
+    family = quasibinomial()
+  )
+)
+
+fit_trend_m2 <- with(
+  design_mi_scored,
+  svyglm(
+    make_formula("sleep_timing_total_score", adj_demographic),
+    family = quasibinomial()
+  )
+)
+
+fit_trend_m3 <- with(
+  design_mi_scored,
+  svyglm(
+    make_formula("sleep_timing_total_score", adj_full_core),
+    family = quasibinomial()
+  )
+)
+
+fit_trend_m4 <- with(
+  design_mi_scored,
+  svyglm(
+    make_formula("sleep_timing_total_score", adj_full_plus),
+    family = quasibinomial()
+  )
+)
+
+fit_z_m4 <- with(
+  design_mi_scored,
+  svyglm(
+    make_formula("sleep_timing_total_score_z", adj_full_plus),
+    family = quasibinomial()
+  )
+)
+
+# pooled trend model across grouped categories
+fit_group_trend_m4 <- with(
+  design_mi_scored,
+  svyglm(
+    make_formula(
+      "as.numeric(factor(sleep_timing_total_group, levels = c('0-4', '5-7', '8-10', '11-13', '14+')))",
+      adj_full_plus
+    ),
+    family = quasibinomial()
+  )
+)
+
+cat("Model fitting completed.\n\n")
+
+# ==============================================================================
+# SECTION 7: Pool estimates across imputations
+# ==============================================================================
+
+cat("Pooling estimates across imputations...\n")
+
+pool_cat_m4         <- MIcombine(fit_cat_m4)
+pool_trend_m1       <- MIcombine(fit_trend_m1)
+pool_trend_m2       <- MIcombine(fit_trend_m2)
+pool_trend_m3       <- MIcombine(fit_trend_m3)
+pool_trend_m4       <- MIcombine(fit_trend_m4)
+pool_z_m4           <- MIcombine(fit_z_m4)
+pool_group_trend_m4 <- MIcombine(fit_group_trend_m4)
+
+cat("Pooling completed.\n\n")
+
+# ==============================================================================
+# SECTION 8: Main displayed results
+# ==============================================================================
+
+summary_4models <- bind_rows(
+  extract_one_term(pool_trend_m1, "sleep_timing_total_score", "Model 1: Unadjusted"),
+  extract_one_term(pool_trend_m2, "sleep_timing_total_score", "Model 2: Demographic-adjusted"),
+  extract_one_term(pool_trend_m3, "sleep_timing_total_score", "Model 3: Lifestyle-adjusted"),
+  extract_one_term(pool_trend_m4, "sleep_timing_total_score", "Model 4: Fully adjusted")
+) %>%
+  mutate(
+    CI_label = mapply(fmt_or, OR, LCI, UCI)
+  )
+
+std_summary <- extract_one_term(
+  pool_z_m4,
+  "sleep_timing_total_score_z",
+  "Standardized OR (per 1-SD increase)"
+) %>%
+  mutate(
+    CI_label = fmt_or(OR, LCI, UCI)
+  )
+
+or_cat_m4   <- extract_pattern_terms(pool_cat_m4, "sleep_timing_total_group")
+or_trend_m4 <- extract_pattern_terms(pool_trend_m4, "sleep_timing_total_score")
+or_z_m4     <- extract_pattern_terms(pool_z_m4, "sleep_timing_total_score_z")
+
+cat("============================================================\n")
+cat("SENSITIVITY RESULTS: CONTINUOUS SCORE MODELS (PHQ-8 >= 9)\n")
+cat("============================================================\n")
+print(summary_4models %>% select(Model, OR, LCI, UCI, CI_label))
+cat("\n")
+
+cat("============================================================\n")
+cat("SENSITIVITY RESULTS: STANDARDIZED SCORE MODEL (PHQ-8 >= 9)\n")
+cat("============================================================\n")
+print(std_summary %>% select(Model, OR, LCI, UCI, CI_label))
+cat("\n")
+
+cat("============================================================\n")
+cat("SUPPLEMENTARY RESULTS: GROUPED SCORE MODEL (FULLY ADJUSTED, PHQ-8 >= 9)\n")
+cat("============================================================\n")
+print(or_cat_m4)
+cat("\n")
+
+# ==============================================================================
+# SECTION 9: Descriptive weighted prevalence by grouped categories
+# - Based on the first imputed dataset only
+# ==============================================================================
+
+design1 <- svydesign(
+  id = ~SDMVPSU,
+  strata = ~SDMVSTRA,
+  weights = ~mec_adj,
+  data = complete_list_scored[[1]],
+  nest = TRUE
+)
+
+prev_by_group <- svyby(
+  ~PHQ8_depression_above_9,
+  ~sleep_timing_total_group,
+  design = design1,
+  FUN = svymean,
+  vartype = c("se", "ci"),
+  na.rm = TRUE
+) %>%
+  as.data.frame() %>%
+  rename(prevalence = PHQ8_depression_above_9) %>%
+  mutate(
+    prevalence_pct = prevalence * 100,
+    ci_low_pct = ci_l * 100,
+    ci_high_pct = ci_u * 100
+  )
+
+cat("============================================================\n")
+cat("DESCRIPTIVE WEIGHTED PREVALENCE BY GROUP (PHQ-8 >= 9, FIRST IMPUTED DATASET)\n")
+cat("============================================================\n")
+print(prev_by_group)
+cat("\n")
+
+# ==============================================================================
+# SECTION 10: P-values for figure display
+# Use MI-pooled P-values instead of single-imputation display P-values
+# ==============================================================================
+
+plot_pvals <- bind_rows(
+  extract_pooled_term(pool_trend_m1, "sleep_timing_total_score", "Model 1: Unadjusted"),
+  extract_pooled_term(pool_trend_m2, "sleep_timing_total_score", "Model 2: Demographic-adjusted"),
+  extract_pooled_term(pool_trend_m3, "sleep_timing_total_score", "Model 3: Lifestyle-adjusted"),
+  extract_pooled_term(pool_trend_m4, "sleep_timing_total_score", "Model 4: Fully adjusted"),
+  extract_pooled_term(pool_z_m4, "sleep_timing_total_score_z", "Standardized OR\n(per 1-SD increase)")
+) %>%
+  select(Model, P_val, P_label)
+
+trend_term_name <- "as.numeric(factor(sleep_timing_total_group, levels = c(\"0-4\", \"5-7\", \"8-10\", \"11-13\", \"14+\")))"
+
+pooled_trend_row <- extract_pooled_term(
+  pool_group_trend_m4,
+  trend_term_name,
+  "P for trend"
+)
+
+p_trend_val <- pooled_trend_row$P_val[1]
+p_trend_txt <- ifelse(
+  p_trend_val < 0.001,
+  "P for linear trend < 0.001",
+  paste0("P for linear trend = ", formatC(p_trend_val, digits = 3, format = "f"))
+)
+
+# ==============================================================================
+# SECTION 11: Forest plot
+# ==============================================================================
+
+COL_MODEL <- "#E69F00"
+COL_STD   <- "#0072B2"
+COL_SHADE <- "#EEF2F7"
+
+plot_data <- bind_rows(
+  summary_4models %>%
+    transmute(
+      Model = Model,
+      OR = OR,
+      LCI = LCI,
+      UCI = UCI
+    ),
+  std_summary %>%
+    transmute(
+      Model = "Standardized OR\n(per 1-SD increase)",
+      OR = OR,
+      LCI = LCI,
+      UCI = UCI
+    )
+) %>%
+  left_join(plot_pvals %>% select(Model, P_label), by = "Model") %>%
+  mutate(
+    CI_label = sprintf("%.2f (%.2f-%.2f)", OR, LCI, UCI),
+    is_std   = grepl("Standardized", Model),
+    pt_col   = ifelse(is_std, COL_STD, COL_MODEL),
+    pt_shp   = ifelse(is_std, 18L, 15L),
+    pt_size  = ifelse(is_std, 5.2, 4.0)
+  )
+
+n <- nrow(plot_data)
+plot_data$y_pos <- seq(n, 1, by = -1)
+y_header <- n + 0.85
+
+X_MIN      <- 0.85
+X_DATA_MAX <- 1.62
+X_CI       <- 1.68
+X_P        <- 2.08
+X_MAX      <- 2.55
+
+shade_df <- plot_data %>%
+  filter(y_pos %% 2 == 0) %>%
+  transmute(ymin = y_pos - 0.5, ymax = y_pos + 0.5)
+
+p <- ggplot(plot_data, aes(x = OR, y = y_pos)) +
+  geom_rect(
+    data = shade_df,
+    aes(xmin = X_MIN, xmax = X_DATA_MAX, ymin = ymin, ymax = ymax),
+    fill = COL_SHADE, alpha = 0.65, inherit.aes = FALSE
+  ) +
+  geom_hline(
+    yintercept = 1.5,
+    linetype = "dotted",
+    color = "gray45",
+    linewidth = 0.55
+  ) +
+  annotate(
+    "segment",
+    x = X_DATA_MAX, xend = X_DATA_MAX,
+    y = 0.3, yend = n + 0.5,
+    color = "gray65", linewidth = 0.35
+  ) +
+  geom_vline(
+    xintercept = 1,
+    linetype = "dashed",
+    color = "gray25",
+    linewidth = 0.72
+  ) +
+  geom_errorbar(
+    aes(xmin = LCI, xmax = UCI, color = pt_col, y = y_pos),
+    orientation = "y",
+    width = 0.22,
+    linewidth = 0.95
+  ) +
+  geom_point(aes(color = pt_col, shape = factor(pt_shp), size = pt_size)) +
+  annotate(
+    "text",
+    x = X_DATA_MAX - 0.03,
+    y = 0.60,
+    label = p_trend_txt,
+    hjust = 1, vjust = 1,
+    size = 3.2,
+    fontface = "italic",
+    color = "#555555"
+  ) +
+  annotate(
+    "text",
+    x = X_CI, y = y_header,
+    label = "aOR (95% CI)",
+    hjust = 0,
+    size = 3.8,
+    fontface = "bold",
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = X_P, y = y_header,
+    label = "P-value",
+    hjust = 0,
+    size = 3.8,
+    fontface = "bold",
+    color = "black"
+  ) +
+  geom_text(
+    data = plot_data,
+    aes(x = X_CI, y = y_pos, label = CI_label),
+    hjust = 0,
+    size = 3.35,
+    color = "black",
+    inherit.aes = FALSE
+  ) +
+  geom_text(
+    data = plot_data,
+    aes(x = X_P, y = y_pos, label = P_label),
+    hjust = 0,
+    size = 3.2,
+    color = "#2c2c2c",
+    fontface = "italic",
+    inherit.aes = FALSE
+  ) +
+  scale_y_continuous(
+    breaks = plot_data$y_pos,
+    labels = plot_data$Model,
+    limits = c(0.25, n + 1.2),
+    expand = c(0, 0)
+  ) +
+  scale_x_continuous(
+    limits = c(X_MIN, X_MAX),
+    breaks = c(0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5),
+    expand = c(0, 0)
+  ) +
+  scale_color_identity() +
+  scale_shape_manual(values = c("15" = 15, "18" = 18), guide = "none") +
+  scale_size_identity() +
+  labs(
+    title = "Sensitivity Analysis: Association Between Cumulative Circadian Misalignment Score and Depression",
+    subtitle = paste0(
+      "Adjusted Odds Ratios (95% CI) - Survey-Weighted Logistic Regression (NHANES)",
+      " - Outcome: PHQ-8 >= 9"
+    ),
+    x = "Adjusted Odds Ratio (95% CI)  |  per 1-unit increase in Cumulative Circadian Misalignment Score",
+    y = NULL,
+    caption = paste0(
+      "\u25a0  Orange squares (Models 1-4): aOR per 1-unit increase in cumulative circadian misalignment score.\n",
+      "\u25c6  Blue diamond: standardized aOR per 1-SD increase (fully adjusted model).\n",
+      "P-values displayed in the figure were derived from MI-pooled estimates and pooled standard errors.\n",
+      "P for linear trend was derived from the MI-pooled fully adjusted grouped trend model.\n",
+      "Survey weights: NHANES MEC sample weights. Color palette: Okabe-Ito (color-blind safe)."
+    )
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    plot.title = element_text(
+      size = 12.5, face = "bold", hjust = 0,
+      margin = margin(b = 4)
+    ),
+    plot.subtitle = element_text(
+      size = 9.0, color = "#444444", hjust = 0,
+      margin = margin(b = 10), lineheight = 1.3
+    ),
+    plot.caption = element_text(
+      size = 7.8, color = "#666666", hjust = 0,
+      lineheight = 1.55, margin = margin(t = 10)
+    ),
+    axis.text.y = element_text(
+      size = 10, color = "black",
+      hjust = 1, lineheight = 1.25
+    ),
+    axis.text.x = element_text(size = 9, color = "black"),
+    axis.title.x = element_text(size = 8.8, margin = margin(t = 7)),
+    axis.line.x = element_line(color = "black", linewidth = 0.5),
+    axis.line.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    legend.position = "none",
+    plot.margin = margin(t = 14, r = 22, b = 14, l = 14)
+  ) +
+  coord_cartesian(clip = "off")
+
+print(p)
+
+ggsave(
+  filename = output_plot_pdf,
+  plot = p,
+  width = 15,
+  height = 5.8,
+  device = cairo_pdf
+)
+
+ggsave(
+  filename = output_plot_png,
+  plot = p,
+  width = 15,
+  height = 5.8,
+  dpi = 300,
+  bg = "white"
+)
+
+cat("Sensitivity-analysis figure saved to:", output_plot_pdf, "\n")
+cat("Sensitivity-analysis figure saved to:", output_plot_png, "\n\n")
+
+# ==============================================================================
+# SECTION 12: Keep key objects in memory for later manual extraction
+# ==============================================================================
+
+analysis_objects_ge9 <- list(
+  pool_cat_m4 = pool_cat_m4,
+  pool_trend_m1 = pool_trend_m1,
+  pool_trend_m2 = pool_trend_m2,
+  pool_trend_m3 = pool_trend_m3,
+  pool_trend_m4 = pool_trend_m4,
+  pool_z_m4 = pool_z_m4,
+  pool_group_trend_m4 = pool_group_trend_m4,
+  or_cat_m4 = or_cat_m4,
+  or_trend_m4 = or_trend_m4,
+  or_z_m4 = or_z_m4,
+  summary_4models = summary_4models,
+  std_summary = std_summary,
+  prev_by_group = prev_by_group,
+  plot_pvals = plot_pvals,
+  p_trend_value = p_trend_val,
+  plot_object = p
+)
+
+cat("Key sensitivity-analysis objects have been created in memory.\n")
+cat("You may extract any table later as needed.\n\n")
+
+cat("============================================================\n")
+cat("SENSITIVITY ANALYSIS COMPLETED SUCCESSFULLY: PHQ-8 >= 9\n")
+cat("============================================================\n")
+
+# ==============================================================================
+# SECTION 13: Publication-Ready Results Table (MI-Pooled, PHQ-8 ≥ 9)
+#
+# Table structure (three panels):
+#   Panel A — Continuous score: per 1-unit increase, Models 1–4
+#   Panel B — Standardized OR: per 1-SD increase, Model 4
+#   Panel C — Categorical score groups: weighted prevalence + aOR, Model 4
+#             (includes MI-pooled P for linear trend)
+#
+# All ORs, CIs, and P-values are from MI-pooled estimates (Rubin's rules).
+# Weighted prevalence (Panel C) is from first imputed dataset (standard practice).
+#
+# Output:
+#   D:/code/table/Table_MI_Sensitivity_PHQ8ge9.docx
+#   D:/code/table/Table_MI_Sensitivity_PHQ8ge9.html
+# ==============================================================================
+
+library(flextable)
+library(officer)
+library(dplyr)
+
+# ── Colour palette ─────────────────────────────────────────────────────────────
+NAVY      <- "#1F3864"
+LIGHT_BLU <- "#EAF2FB"
+MID_BLU   <- "#D6E4F0"
+WHITE     <- "#FFFFFF"
+
+# ── Formatting helpers ─────────────────────────────────────────────────────────
+fmt_or_ci <- function(or, lci, uci) {
+  sprintf("%.2f (%.2f\u2013%.2f)", or, lci, uci)
+}
+
+fmt_p_mi <- function(p) {
+  if (is.na(p))  return("\u2014")
+  if (p < 0.001) return("<0.001")
+  sprintf("%.3f", p)
+}
+
+fmt_prev <- function(pct, lo, hi) {
+  sprintf("%.1f (%.1f\u2013%.1f)", pct, lo, hi)
+}
+
+em <- "\u2014"
+
+# ── MI-pooled Wald P-value from pooled estimate / SE ─────────────────────────
+mi_pval <- function(pool_obj, term_name) {
+  sm       <- as.data.frame(summary(pool_obj))
+  sm$term  <- rownames(sm)
+  row      <- sm[sm$term == term_name, ]
+  if (nrow(row) != 1) return(NA_real_)
+  z <- row$results / row$se
+  2 * pnorm(-abs(z))
+}
+
+# ── Safe OR/CI extractor from pooled object ───────────────────────────────────
+mi_or_row <- function(pool_obj, term_name) {
+  sm       <- as.data.frame(summary(pool_obj))
+  sm$term  <- rownames(sm)
+  row      <- sm[sm$term == term_name, ]
+  if (nrow(row) != 1) stop("Term not found: ", term_name)
+  list(
+    OR  = exp(row$results),
+    LCI = exp(row$`(lower`),
+    UCI = exp(row$`upper)`),
+    P   = mi_pval(pool_obj, term_name)
+  )
+}
+
+# ==============================================================================
+# PANEL A — Continuous score: per 1-unit increase, Models 1–4
+# ==============================================================================
+cont_term <- "sleep_timing_total_score"
+
+panel_A <- lapply(
+  list(
+    list(obj = pool_trend_m1, label = "Model 1: Unadjusted"),
+    list(obj = pool_trend_m2, label = "Model 2: Demographic-adjusted\u1d43"),
+    list(obj = pool_trend_m3, label = "Model 3: Lifestyle-adjusted\u1d47"),
+    list(obj = pool_trend_m4, label = "Model 4: Fully adjusted\u1d9c")
+  ),
+  function(x) {
+    r <- mi_or_row(x$obj, cont_term)
+    data.frame(
+      col1 = x$label,
+      col2 = em,
+      col3 = fmt_or_ci(r$OR, r$LCI, r$UCI),
+      col4 = fmt_p_mi(r$P),
+      stringsAsFactors = FALSE
+    )
+  }
+) %>% bind_rows()
+
+# ==============================================================================
+# PANEL B — Standardized OR (per 1-SD increase, Model 4)
+# ==============================================================================
+std_term <- "sleep_timing_total_score_z"
+
+r_z <- mi_or_row(pool_z_m4, std_term)
+
+# Survey-weighted SD from first imputed dataset
+design1 <- svydesign(
+  id = ~SDMVPSU, strata = ~SDMVSTRA, weights = ~mec_adj,
+  data = complete_list_scored[[1]], nest = TRUE
+)
+sd_score <- sqrt(as.numeric(svyvar(~sleep_timing_total_score, design1, na.rm = TRUE)))
+
+panel_B <- data.frame(
+  col1 = sprintf("Standardized OR (per 1-SD = %.2f units)\u1d9c", sd_score),
+  col2 = em,
+  col3 = fmt_or_ci(r_z$OR, r_z$LCI, r_z$UCI),
+  col4 = fmt_p_mi(r_z$P),
+  stringsAsFactors = FALSE
+)
+
+# ==============================================================================
+# PANEL C — Categorical groups (Model 4, fully adjusted)
+# Reference group: 0-4
+# Weighted prevalence: PHQ8_depression_above_9, first imputed dataset
+# ==============================================================================
+
+# Weighted prevalence per group
+prev_tab <- svyby(
+  ~PHQ8_depression_above_9,
+  ~sleep_timing_total_group,
+  design = design1,
+  FUN    = svymean,
+  vartype = "ci",
+  na.rm  = TRUE
+) %>%
+  as.data.frame() %>%
+  mutate(
+    pct   = PHQ8_depression_above_9 * 100,
+    ci_lo = ci_l * 100,
+    ci_hi = ci_u * 100,
+    prev_label = fmt_prev(pct, ci_lo, ci_hi)
+  )
+
+# Coefficient names in MI-pooled categorical model
+groups <- list(
+  list(grp = "0-4",   coef = NULL,
+       ref = TRUE),
+  list(grp = "5-7",
+       coef = 'relevel(sleep_timing_total_group, ref = "0-4")5-7',
+       ref = FALSE),
+  list(grp = "8-10",
+       coef = 'relevel(sleep_timing_total_group, ref = "0-4")8-10',
+       ref = FALSE),
+  list(grp = "11-13",
+       coef = 'relevel(sleep_timing_total_group, ref = "0-4")11-13',
+       ref = FALSE),
+  list(grp = "14+",
+       coef = 'relevel(sleep_timing_total_group, ref = "0-4")14+',
+       ref = FALSE)
+)
+
+panel_C <- lapply(groups, function(g) {
+  prev_row <- prev_tab[
+    as.character(prev_tab$sleep_timing_total_group) == g$grp, ]
+  prev_str <- if (nrow(prev_row) == 1) prev_row$prev_label else em
+  
+  if (g$ref) {
+    data.frame(
+      col1 = paste0("Score group ", g$grp, " (reference)"),
+      col2 = prev_str,
+      col3 = "1.00 (reference)",
+      col4 = em,
+      stringsAsFactors = FALSE
+    )
+  } else {
+    r <- mi_or_row(pool_cat_m4, g$coef)
+    data.frame(
+      col1 = paste0("Score group ", g$grp),
+      col2 = prev_str,
+      col3 = fmt_or_ci(r$OR, r$LCI, r$UCI),
+      col4 = fmt_p_mi(r$P),
+      stringsAsFactors = FALSE
+    )
+  }
+}) %>% bind_rows()
+
+# P for linear trend (MI-pooled)
+panel_C_trend <- data.frame(
+  col1 = "   P for linear trend",
+  col2 = em,
+  col3 = em,
+  col4 = fmt_p_mi(p_trend_val),
+  stringsAsFactors = FALSE
+)
+
+# ==============================================================================
+# Assemble full table with labelled section headers
+# ==============================================================================
+make_hdr <- function(txt) {
+  data.frame(col1 = txt, col2 = em, col3 = em, col4 = em,
+             stringsAsFactors = FALSE)
+}
+
+full_table <- bind_rows(
+  make_hdr("Panel A. Cumulative circadian misalignment score as continuous variable (per 1-unit increase)"),
+  panel_A,
+  make_hdr("Panel B. Standardized effect size"),
+  panel_B,
+  make_hdr("Panel C. Cumulative circadian misalignment score by group category (fully adjusted model\u1d9c)")  ,
+  panel_C,
+  panel_C_trend
+)
+
+colnames(full_table) <- c(
+  "Model / Exposure Category",
+  "Weighted Prevalence, % (95% CI)\u1d30",
+  "aOR (95% CI)",
+  "P-value"
+)
+
+# ==============================================================================
+# Build flextable
+# ==============================================================================
+header_rows <- which(full_table[[1]] %in% c(
+  "Panel A. Cumulative circadian misalignment score as continuous variable (per 1-unit increase)",
+  "Panel B. Standardized effect size",
+  "Panel C. Cumulative circadian misalignment score by group category (fully adjusted model\u1d9c)"
+))
+
+ref_rows   <- grep("reference",          full_table[[1]])
+trend_rows <- grep("P for linear trend", full_table[[1]])
+
+data_rows  <- setdiff(seq_len(nrow(full_table)), header_rows)
+shade_odd  <- data_rows[seq(1, length(data_rows), 2)]
+shade_even <- data_rows[seq(2, length(data_rows), 2)]
+
+ft <- flextable(full_table) %>%
+  
+  # ── Typography ───────────────────────────────────────────────────────────────
+  font(fontname = "Times New Roman", part = "all") %>%
+  fontsize(size = 10,   part = "body") %>%
+  fontsize(size = 10.5, part = "header") %>%
+  
+  # ── Header ───────────────────────────────────────────────────────────────────
+  bold(part = "header") %>%
+  bg(bg = NAVY, part = "header") %>%
+  color(color = "white", part = "header") %>%
+  align(align = "center", part = "header") %>%
+  valign(valign = "bottom", part = "header") %>%
+  
+  # ── Section header rows ──────────────────────────────────────────────────────
+  bold(i  = header_rows, part = "body") %>%
+  bg(i    = header_rows, bg = MID_BLU, part = "body") %>%
+  color(i = header_rows, color = NAVY, part = "body") %>%
+  italic(i = header_rows, italic = FALSE, part = "body") %>%
+  
+  # ── Alternating row shading ──────────────────────────────────────────────────
+  bg(i = shade_odd,  bg = LIGHT_BLU, part = "body") %>%
+  bg(i = shade_even, bg = WHITE,     part = "body") %>%
+  
+  # ── Reference row ───────────────────────────────────────────────────────────
+  italic(i = ref_rows,  part = "body") %>%
+  color(i  = ref_rows,  color = "#666666", part = "body") %>%
+  
+  # ── P-for-trend row ─────────────────────────────────────────────────────────
+  italic(i = trend_rows, part = "body") %>%
+  color(i  = trend_rows, color = "#333333", part = "body") %>%
+  
+  # ── Column alignment ─────────────────────────────────────────────────────────
+  align(j = 1, align = "left",   part = "body") %>%
+  align(j = 2, align = "center", part = "body") %>%
+  align(j = 3, align = "center", part = "body") %>%
+  align(j = 4, align = "center", part = "body") %>%
+  
+  # ── Column widths (inches) ───────────────────────────────────────────────────
+  width(j = 1, width = 3.50) %>%
+  width(j = 2, width = 1.80) %>%
+  width(j = 3, width = 1.60) %>%
+  width(j = 4, width = 0.90) %>%
+  
+  # ── Borders ──────────────────────────────────────────────────────────────────
+  border_remove() %>%
+  hline_top(border    = fp_border(color = NAVY, width = 2.0), part = "header") %>%
+  hline_bottom(border = fp_border(color = NAVY, width = 1.5), part = "header") %>%
+  hline_bottom(border = fp_border(color = NAVY, width = 1.5), part = "body") %>%
+  hline(i = header_rows,
+        border = fp_border(color = "#7F9FB6", width = 0.75), part = "body") %>%
+  
+  # ── Spacing ──────────────────────────────────────────────────────────────────
+  padding(padding.top  = 5, padding.bottom = 5,
+          padding.left = 8, padding.right  = 8, part = "all") %>%
+  height(height = 0.34, part = "body") %>%
+  hrule(rule = "atleast", part = "body") %>%
+  line_spacing(space = 1.10, part = "all") %>%
+  
+  set_table_properties(layout = "fixed") %>%
+  fix_border_issues()
+
+# ── Footnotes ─────────────────────────────────────────────────────────────────
+ft <- add_footer_lines(ft, values = c(
+  paste0(
+    "Abbreviations: aOR, adjusted odds ratio; CI, confidence interval; ",
+    "MI, multiple imputation; PHQ-8, Patient Health Questionnaire-8; ",
+    "SD, standard deviation."
+  ),
+  paste0(
+    "Sensitivity analysis: outcome defined as PHQ-8 total score \u2265 9 ",
+    "(alternative threshold vs. primary analysis PHQ-8 \u2265 10). ",
+    "A lower threshold captures mild-to-moderate depressive symptoms."
+  ),
+  paste0(
+    "All aORs, 95% CIs, and P-values are derived from MI-pooled estimates ",
+    "(Rubin\u2019s rules via MIcombine). ",
+    "P-values are Wald-type z-statistics computed from pooled estimates ",
+    "and pooled standard errors."
+  ),
+  paste0(
+    "\u1d30 Weighted prevalence (%) and 95% CI estimated from the first imputed dataset ",
+    "using survey-weighted means (svymean). ",
+    "Reporting prevalence from a single imputed dataset is standard practice ",
+    "for descriptive statistics alongside MI regression results."
+  ),
+  paste0(
+    "\u1d43 Model 2: adjusted for age (continuous), sex, and race/ethnicity."
+  ),
+  paste0(
+    "\u1d47 Model 3: additionally adjusted for education level, smoking status, ",
+    "marital status, BMI, alcohol consumption, diabetes status, hypertension status, ",
+    "employment status, physical activity (MET-min/week), and poverty-income ratio."
+  ),
+  paste0(
+    "\u1d9c Model 4 (fully adjusted): additionally adjusted for sedentary time (min/day). ",
+    "Standardized OR and all group-level ORs are from this model."
+  ),
+  paste0(
+    "P for linear trend: score group entered as an ordinal numeric variable (1\u20135) ",
+    "in the fully adjusted MI model; P-value is MI-pooled."
+  ),
+  paste0(
+    "Survey design: NHANES MEC examination weights (mec_adj) applied throughout; ",
+    "variance estimated via Taylor-series linearisation."
+  )
+)) %>%
+  font(fontname = "Times New Roman", part = "footer") %>%
+  fontsize(size = 8.5,     part = "footer") %>%
+  color(color = "#444444", part = "footer") %>%
+  italic(part = "footer") %>%
+  line_spacing(space = 1.25, part = "footer")
+
+# ==============================================================================
+# Export
+# ==============================================================================
+out_dir <- "D:/code/table"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+# ── Word document (.docx) — primary journal submission format ─────────────────
+doc <- read_docx() %>%
+  body_add_par(
+    paste0(
+      "Table (Sensitivity Analysis: PHQ-8 \u2265 9). ",
+      "Association Between Cumulative Circadian Misalignment Score ",
+      "and Depressive Symptoms: ",
+      "Survey-Weighted Multiply Imputed Logistic Regression (NHANES)"
+    ),
+    style = "heading 3"
+  ) %>%
+  body_add_flextable(ft) %>%
+  body_add_par("", style = "Normal")
+
+print(doc,
+      target = file.path(out_dir, "Table_MI_Sensitivity_PHQ8ge9.docx"))
+
+# ── HTML browser preview ──────────────────────────────────────────────────────
+save_as_html(ft,
+             path = file.path(out_dir, "Table_MI_Sensitivity_PHQ8ge9.html"))
+
+message("[OK] Word: ", file.path(out_dir, "Table_MI_Sensitivity_PHQ8ge9.docx"))
+message("[OK] HTML: ", file.path(out_dir, "Table_MI_Sensitivity_PHQ8ge9.html"))
+message("[DONE] Sensitivity (PHQ-8 \u2265 9) results table complete.")
+
+# Console preview
+print(ft)
