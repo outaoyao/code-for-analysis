@@ -1,0 +1,56 @@
+library(cowplot)
+library(ggplot2)
+library(magick)
+
+# -----------------------------
+# 1. Load individual TIFF images
+# -----------------------------
+img_A <- image_read("photo/forest_plot_sensitivity_A_final.tiff")
+img_B <- image_read("photo/forest_plot_sensitivity_B_final.tiff")
+img_C <- image_read("photo/forest_plot_sensitivity_C_final.tiff")
+img_D <- image_read("photo/forest_plot_sensitivity_D_final.tiff")
+
+# -----------------------------
+# 2. Convert magick objects to ggdraw for cowplot
+# -----------------------------
+plot_A <- ggdraw() + draw_image(img_A)
+plot_B <- ggdraw() + draw_image(img_B)
+plot_C <- ggdraw() + draw_image(img_C)
+plot_D <- ggdraw() + draw_image(img_D)
+
+# -----------------------------
+# 3. Arrange plots into 2x2 grid
+# -----------------------------
+fig_S1 <- plot_grid(
+  plot_A, plot_B,
+  plot_C, plot_D,
+  ncol = 2,
+  labels = NULL,      # A–D labels already embedded in each plot
+  align = "hv"
+)
+
+# -----------------------------
+# 4. Export final Figure S1
+# -----------------------------
+ggsave(
+  filename = "photo/Figure_S1.tiff",
+  plot = fig_S1,
+  width = 24, height = 12,     # adjust to your layout
+  units = "in",
+  dpi = 600,                   # ≥600 dpi for line plots
+  compression = "lzw",
+  device = "tiff",
+  bg = "white"
+)
+
+# -----------------------------
+# 5. Figure Legends (English)
+# -----------------------------
+# Figure S1. Sensitivity analysis forest plots for cumulative circadian misalignment score and depressive symptom outcomes.
+# Panels A–D display adjusted odds ratios (aORs) with 95% confidence intervals (CIs) for different depressive symptom definitions:
+# (A) Moderate depressive symptoms, (B) Moderate-to-severe depressive symptoms,
+# (C) PHQ-8 ≥ 9, and (D) PHQ-8 ≥ 10.
+# All analyses were conducted using survey-weighted logistic regression models adjusted for demographics, lifestyle, socioeconomics, and sedentary behavior.
+# Standardized ORs are reported per 1-standard deviation increase in cumulative circadian misalignment score.
+# Panel labels (A–D) are included within each individual plot.
+# Figures contain no captions; all descriptions appear in the manuscript text and the Figure Legends section.
