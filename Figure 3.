@@ -1,0 +1,139 @@
+# ==============================================================================
+# Figure 3. Final submission-ready composite figure (VERTICAL LAYOUT, REVISED)
+#
+# Panels:
+#   A = Figure_3A_Final.tiff
+#   B = Figure_3B_Model4_RCS.tiff     # used here as Figure 3B
+#   C = Figure_3C_Subgroup_Forest.tiff
+#
+# Output:
+#   D:/code/photo/Figure_3.tiff
+#   D:/code/photo/Figure_3.png
+#
+# Notes:
+#   - Submission-ready
+#   - TIFF 600 dpi
+#   - PNG 300 dpi
+#   - No caption inside figure
+#   - Pure English
+#   - Revised to prevent truncation of panel C
+# ==============================================================================
+
+# install.packages(c("magick", "cowplot", "ggplot2"))
+
+library(magick)
+library(cowplot)
+library(ggplot2)
+
+# ------------------------------------------------------------------------------
+# 1. Paths
+# ------------------------------------------------------------------------------
+img_dir <- "D:/code/photo"
+
+file_3A <- file.path(img_dir, "Figure_3A_Final.tiff")
+file_3B <- file.path(img_dir, "Figure_3B_Model4_RCS.tiff")
+file_3C <- file.path(img_dir, "Figure_3C_Subgroup_Forest.tiff")
+
+out_tiff <- file.path(img_dir, "Figure_3.tiff")
+out_png  <- file.path(img_dir, "Figure_3.png")
+
+# ------------------------------------------------------------------------------
+# 2. Check files
+# ------------------------------------------------------------------------------
+required_files <- c(file_3A, file_3B, file_3C)
+missing_files <- required_files[!file.exists(required_files)]
+
+if (length(missing_files) > 0) {
+  stop(
+    sprintf(
+      "The following input files were not found:\n%s",
+      paste(missing_files, collapse = "\n")
+    )
+  )
+}
+
+# ------------------------------------------------------------------------------
+# 3. Read images
+# ------------------------------------------------------------------------------
+img_3A <- image_read(file_3A)
+img_3B <- image_read(file_3B)
+img_3C <- image_read(file_3C)
+
+# ------------------------------------------------------------------------------
+# 4. Standardize widths carefully
+# ------------------------------------------------------------------------------
+# Keep A and B consistent
+target_width_ab <- 3200
+
+# Give C a wider base because it contains right-side text columns
+target_width_c  <- 4200
+
+img_3A <- image_resize(img_3A, paste0(target_width_ab))
+img_3B <- image_resize(img_3B, paste0(target_width_ab))
+img_3C <- image_resize(img_3C, paste0(target_width_c))
+
+# Optional: trim surrounding blank margins from the source panels
+# This helps reduce wasted space before stacking
+img_3A <- image_trim(img_3A)
+img_3B <- image_trim(img_3B)
+img_3C <- image_trim(img_3C)
+
+# Add a small white border so trimmed panels do not touch edges
+img_3A <- image_border(img_3A, color = "white", geometry = "20x20")
+img_3B <- image_border(img_3B, color = "white", geometry = "20x20")
+img_3C <- image_border(img_3C, color = "white", geometry = "20x20")
+
+# ------------------------------------------------------------------------------
+# 5. Convert images to drawable objects
+# ------------------------------------------------------------------------------
+g_3A <- ggdraw() + draw_image(img_3A, x = 0, y = 0, width = 1, height = 1)
+g_3B <- ggdraw() + draw_image(img_3B, x = 0, y = 0, width = 1, height = 1)
+g_3C <- ggdraw() + draw_image(img_3C, x = 0, y = 0, width = 1, height = 1)
+
+# ------------------------------------------------------------------------------
+# 6. Combine vertically
+# ------------------------------------------------------------------------------
+# Increase the relative height of C to preserve readability
+figure_3 <- plot_grid(
+  g_3A,
+  g_3B,
+  g_3C,
+  ncol = 1,
+  align = "v",
+  rel_heights = c(1.00, 1.10, 1.45)
+)
+
+# Add a clean white wrapper
+figure_3_final <- ggdraw() +
+  draw_plot(figure_3, x = 0, y = 0, width = 1, height = 1)
+
+# ------------------------------------------------------------------------------
+# 7. Export final figure
+# ------------------------------------------------------------------------------
+# Slightly wider export to avoid truncation of panel C right-side text
+ggsave(
+  filename = out_tiff,
+  plot = figure_3_final,
+  device = "tiff",
+  dpi = 600,
+  width = 10.2,
+  height = 16.2,
+  units = "in",
+  compression = "lzw",
+  bg = "white"
+)
+
+ggsave(
+  filename = out_png,
+  plot = figure_3_final,
+  device = "png",
+  dpi = 300,
+  width = 10.2,
+  height = 16.2,
+  units = "in",
+  bg = "white"
+)
+
+message(sprintf("[OK] TIFF exported: %s", out_tiff))
+message(sprintf("[OK] PNG exported: %s", out_png))
+message("[DONE] Figure 3 final submission version created successfully.")
