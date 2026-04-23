@@ -1,0 +1,1117 @@
+################################################################################
+# JOINT RCS ANALYSIS: Survey-weighted dual restricted cubic splines with
+# multiply imputed data
+#
+# PURPOSE:
+# - Evaluate the joint dose-response association of cumulative circadian
+#   misalignment score and weekday sleep duration with depression
+# - Use survey-weighted logistic regression across multiply imputed datasets
+# - Pool coefficients and covariance matrices using Rubin's rules
+# - Estimate:
+#     (1) overall association for each exposure
+#     (2) non-linearity for each exposure
+#     (3) linear-by-linear interaction
+# - Visualize:
+#     (A) marginal curve for circadian misalignment score
+#     (B) marginal curve for weekday sleep duration
+#     (C) 2D joint effect heatmap
+#
+# NOTES:
+# - Observational and cross-sectional only; no causal language.
+# - P-values are derived from MI-pooled Wald tests.
+# - Default outcome: PHQ-8 >= 10
+################################################################################
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(survey)
+  library(mitools)
+  library(Hmisc)      # rcspline.eval
+  library(ggplot2)
+  library(patchwork)
+  library(car)
+})
+
+options(survey.lonely.psu = "adjust")
+
+# ==============================================================================
+# 0. Paths
+# ==============================================================================
+
+base_path <- "D:/code"
+setwd(base_path)
+
+input_file   <- "13.PHQ8_MI_scored_datasets_list_v2.rds"
+output_png   <- "Figure_Joint_RCS_MI_PHQ8_ge10.png"
+output_pdf   <- "Figure_Joint_RCS_MI_PHQ8_ge10.pdf"
+
+cat("============================================================\n")
+cat("JOINT RCS ANALYSIS STARTED: PHQ-8 >= 10\n")
+cat("============================================================\n\n")
+
+# ==============================================================================
+# 1. Load MI datasets
+# ==============================================================================
+
+complete_list_scored <- readRDS(input_file)
+
+cat("Multiply imputed datasets loaded.\n")
+cat("Number of imputations:", length(complete_list_scored), "\n")
+cat("Sample size per dataset:", nrow(complete_list_scored[[1]]), "\n\n")
+
+# ==============================================================================
+# 2. Ensure outcome exists
+# ==============================================================================
+
+complete_list_scored <- lapply(complete_list_scored, function(df) {
+  
+  if (!"PHQ8_depression_above_10" %in% names(df)) {
+    if (!"PHQ8_SCORE" %in% names(df)) {
+      stop("Neither PHQ8_depression_above_10 nor PHQ8_SCORE was found in the dataset.")
+    }
+    
+    df <- df %>%
+      mutate(
+        PHQ8_depression_above_10 = case_when(
+          PHQ8_SCORE >= 10 ~ 1,
+          PHQ8_SCORE < 10  ~ 0,
+          TRUE ~ NA_real_
+        )
+      )
+  }
+  
+  df
+})
+
+cat("Outcome confirmed as PHQ-8 >= 10.\n\n")
+
+# ==============================================================================
+# 3. Analysis settings
+# ==============================================================================
+
+# ---- Default outcome ----
+OUTCOME_VAR <- "PHQ8_depression_above_10"
+# To switch to PHQ-8 >= 9, replace with:
+# OUTCOME_VAR <- "PHQ8_depression_above_9"
+
+EXPOSURE1_VAR <- "sleep_timing_total_score"
+EXPOSURE2_VAR <- "dur_wd"
+
+EXPOSURE1_LAB <- "Cumulative Circadian Misalignment Score"
+EXPOSURE2_LAB <- "Weekday Sleep Duration (hours)"
+
+adj_covs <- paste(
+  "RIDAGEYR + RIAGENDR + RIDRETH1 + DMDEDUC2 +",
+  "smoke_status + DMDMARTZ + BMI_value + AlcoholCategory +",
+  "diabetes_status + hypertension_status + work_status +",
+  "MET_total + INDFMPIR + sedentary_min"
+)
+
+# 3-knot splines to match your original dual-RCS structure
+x1_ref <- complete_list_scored[[1]][[EXPOSURE1_VAR]]
+x2_ref <- complete_list_scored[[1]][[EXPOSURE2_VAR]]
+
+knots_x1 <- as.numeric(quantile(x1_ref, probs = c(0.10, 0.50, 0.90), na.rm = TRUE))
+knots_x2 <- as.numeric(quantile(x2_ref, probs = c(0.10, 0.50, 0.90), na.rm = TRUE))
+
+ref_x1 <- median(x1_ref, na.rm = TRUE)
+ref_x2 <- median(x2_ref, na.rm = TRUE)
+
+cat("Spline knot locations for exposure 1:\n")
+print(knots_x1)
+cat("Spline knot locations for exposure 2:\n")
+print(knots_x2)
+cat("Reference value for exposure 1:", round(ref_x1, 4), "\n")
+cat("Reference value for exposure 2:", round(ref_x2, 4), "\n\n")
+
+# ==============================================================================
+# 4. Helper functions
+# ==============================================================================
+
+fmt_p <- function(p) {
+  if (is.na(p)) return(NA_character_)
+  if (p < 0.001) return("<0.001")
+  sprintf("%.3f", p)
+}
+
+build_rcs3_basis_df <- function(x, knots, prefix) {
+  basis <- as.data.frame(rcspline.eval(x, knots = knots, inclx = TRUE))
+  names(basis) <- c(
+    paste0(prefix, "_lin"),
+    paste0(prefix, "_nonlin", seq_len(ncol(basis) - 1))
+  )
+  basis
+}
+
+build_joint_model_data <- function(df, x1var, x2var, knots1, knots2) {
+  basis1 <- build_rcs3_basis_df(df[[x1var]], knots1, "x1")
+  basis2 <- build_rcs3_basis_df(df[[x2var]], knots2, "x2")
+  bind_cols(df, basis1, basis2)
+}
+
+pool_coef_vcov <- function(fit_list) {
+  m <- length(fit_list)
+  
+  coef_list <- lapply(fit_list, coef)
+  vcov_list <- lapply(fit_list, vcov)
+  
+  coef_names <- names(coef_list[[1]])
+  
+  Q <- do.call(cbind, coef_list)
+  qbar <- rowMeans(Q)
+  
+  Ubar <- Reduce(`+`, vcov_list) / m
+  
+  centered <- lapply(coef_list, function(b) matrix(b - qbar, ncol = 1))
+  B <- Reduce(`+`, lapply(centered, function(d) d %*% t(d))) / (m - 1)
+  
+  Tmat <- Ubar + (1 + 1 / m) * B
+  
+  rownames(Tmat) <- coef_names
+  colnames(Tmat) <- coef_names
+  
+  list(
+    coef = qbar,
+    vcov = Tmat,
+    coef_names = coef_names,
+    m = m
+  )
+}
+
+wald_test_terms <- function(beta, vcov_mat, term_names) {
+  b <- beta[term_names]
+  V <- vcov_mat[term_names, term_names, drop = FALSE]
+  
+  stat <- as.numeric(t(b) %*% solve(V) %*% b)
+  df <- length(term_names)
+  p <- pchisq(stat, df = df, lower.tail = FALSE)
+  
+  tibble(
+    chisq = stat,
+    df = df,
+    p_value = p,
+    P_label = fmt_p(p)
+  )
+}
+
+make_reference_row <- function(df) {
+  ref <- df %>%
+    summarise(
+      RIDAGEYR = median(RIDAGEYR, na.rm = TRUE),
+      BMI_value = median(BMI_value, na.rm = TRUE),
+      MET_total = median(MET_total, na.rm = TRUE),
+      INDFMPIR = median(INDFMPIR, na.rm = TRUE),
+      sedentary_min = median(sedentary_min, na.rm = TRUE)
+    )
+  
+  get_mode <- function(x) {
+    ux <- na.omit(x)
+    names(sort(table(ux), decreasing = TRUE))[1]
+  }
+  
+  ref$RIAGENDR <- factor(get_mode(df$RIAGENDR), levels = levels(df$RIAGENDR))
+  ref$RIDRETH1 <- factor(get_mode(df$RIDRETH1), levels = levels(df$RIDRETH1))
+  ref$DMDEDUC2 <- factor(get_mode(df$DMDEDUC2), levels = levels(df$DMDEDUC2))
+  ref$smoke_status <- factor(get_mode(df$smoke_status), levels = levels(df$smoke_status))
+  ref$DMDMARTZ <- factor(get_mode(df$DMDMARTZ), levels = levels(df$DMDMARTZ))
+  ref$AlcoholCategory <- factor(get_mode(df$AlcoholCategory), levels = levels(df$AlcoholCategory))
+  ref$diabetes_status <- factor(get_mode(df$diabetes_status), levels = levels(df$diabetes_status))
+  ref$hypertension_status <- factor(get_mode(df$hypertension_status), levels = levels(df$hypertension_status))
+  ref$work_status <- factor(get_mode(df$work_status), levels = levels(df$work_status))
+  
+  ref
+}
+
+predict_pooled_or <- function(pool_obj, newdata_grid, newdata_ref, formula_rhs) {
+  mm_grid <- model.matrix(formula_rhs, data = newdata_grid)
+  mm_ref  <- model.matrix(formula_rhs, data = newdata_ref)
+  
+  beta <- pool_obj$coef
+  V    <- pool_obj$vcov
+  
+  diff_mat <- sweep(mm_grid, 2, mm_ref[1, ], FUN = "-")
+  log_or   <- as.numeric(diff_mat %*% beta)
+  
+  se_log_or <- apply(diff_mat, 1, function(d) {
+    sqrt(as.numeric(t(d) %*% V %*% d))
+  })
+  
+  tibble(
+    log_or = log_or,
+    OR = exp(log_or),
+    LL = exp(log_or - 1.96 * se_log_or),
+    UL = exp(log_or + 1.96 * se_log_or)
+  )
+}
+
+# ==============================================================================
+# 5. Build spline bases in each imputed dataset
+# ==============================================================================
+
+mi_joint_datasets <- lapply(complete_list_scored, function(df) {
+  build_joint_model_data(
+    df = df,
+    x1var = EXPOSURE1_VAR,
+    x2var = EXPOSURE2_VAR,
+    knots1 = knots_x1,
+    knots2 = knots_x2
+  )
+})
+
+cat("Joint spline bases created for all imputed datasets.\n\n")
+
+# ==============================================================================
+# 6. Fit pooled joint model and nested models
+# ==============================================================================
+
+make_formula_joint <- function(include_x1_nonlin = TRUE,
+                               include_x2_nonlin = TRUE,
+                               include_interaction = FALSE) {
+  
+  x1_terms <- if (include_x1_nonlin) {
+    c("x1_lin", "x1_nonlin1")
+  } else {
+    c("x1_lin")
+  }
+  
+  x2_terms <- if (include_x2_nonlin) {
+    c("x2_lin", "x2_nonlin1")
+  } else {
+    c("x2_lin")
+  }
+  
+  rhs_terms <- c(x1_terms, x2_terms)
+  
+  if (include_interaction) {
+    rhs_terms <- c(rhs_terms, "x1_lin:x2_lin")
+  }
+  
+  rhs_terms <- c(rhs_terms, adj_covs)
+  
+  as.formula(paste(OUTCOME_VAR, "~", paste(rhs_terms, collapse = " + ")))
+}
+
+cat("Fitting dual-RCS models across imputations...\n")
+
+formula_joint        <- make_formula_joint(TRUE,  TRUE,  FALSE)
+formula_x1_linear    <- make_formula_joint(FALSE, TRUE,  FALSE)
+formula_x2_linear    <- make_formula_joint(TRUE,  FALSE, FALSE)
+formula_interaction  <- make_formula_joint(TRUE,  TRUE,  TRUE)
+
+fit_joint_list <- lapply(mi_joint_datasets, function(df) {
+  design <- svydesign(
+    id = ~SDMVPSU,
+    strata = ~SDMVSTRA,
+    weights = ~mec_adj,
+    data = df,
+    nest = TRUE
+  )
+  svyglm(formula_joint, design = design, family = quasibinomial())
+})
+
+fit_x1_linear_list <- lapply(mi_joint_datasets, function(df) {
+  design <- svydesign(
+    id = ~SDMVPSU,
+    strata = ~SDMVSTRA,
+    weights = ~mec_adj,
+    data = df,
+    nest = TRUE
+  )
+  svyglm(formula_x1_linear, design = design, family = quasibinomial())
+})
+
+fit_x2_linear_list <- lapply(mi_joint_datasets, function(df) {
+  design <- svydesign(
+    id = ~SDMVPSU,
+    strata = ~SDMVSTRA,
+    weights = ~mec_adj,
+    data = df,
+    nest = TRUE
+  )
+  svyglm(formula_x2_linear, design = design, family = quasibinomial())
+})
+
+fit_interaction_list <- lapply(mi_joint_datasets, function(df) {
+  design <- svydesign(
+    id = ~SDMVPSU,
+    strata = ~SDMVSTRA,
+    weights = ~mec_adj,
+    data = df,
+    nest = TRUE
+  )
+  svyglm(formula_interaction, design = design, family = quasibinomial())
+})
+
+cat("Model fitting completed.\n\n")
+
+# ==============================================================================
+# 7. Pool coefficients and covariance matrices
+# ==============================================================================
+
+cat("Pooling coefficients and covariance matrices...\n")
+
+pool_joint       <- pool_coef_vcov(fit_joint_list)
+pool_x1_linear   <- pool_coef_vcov(fit_x1_linear_list)
+pool_x2_linear   <- pool_coef_vcov(fit_x2_linear_list)
+pool_interaction <- pool_coef_vcov(fit_interaction_list)
+
+cat("Pooling completed.\n\n")
+
+# ==============================================================================
+# 8. Pooled Wald tests
+# ==============================================================================
+
+cat("============================================================\n")
+cat("POOLED WALD TESTS\n")
+cat("============================================================\n")
+
+# Overall association
+overall_x1 <- wald_test_terms(
+  pool_joint$coef, pool_joint$vcov,
+  c("x1_lin", "x1_nonlin1")
+) %>% mutate(Test = "Overall association: circadian misalignment")
+
+overall_x2 <- wald_test_terms(
+  pool_joint$coef, pool_joint$vcov,
+  c("x2_lin", "x2_nonlin1")
+) %>% mutate(Test = "Overall association: weekday sleep duration")
+
+# Non-linearity
+nonlin_x1 <- wald_test_terms(
+  pool_joint$coef, pool_joint$vcov,
+  c("x1_nonlin1")
+) %>% mutate(Test = "Non-linearity: circadian misalignment")
+
+nonlin_x2 <- wald_test_terms(
+  pool_joint$coef, pool_joint$vcov,
+  c("x2_nonlin1")
+) %>% mutate(Test = "Non-linearity: weekday sleep duration")
+
+# Interaction
+interaction_test <- wald_test_terms(
+  pool_interaction$coef, pool_interaction$vcov,
+  c("x1_lin:x2_lin")
+) %>% mutate(Test = "Interaction: circadian misalignment x sleep duration")
+
+test_results <- bind_rows(
+  overall_x1, overall_x2, nonlin_x1, nonlin_x2, interaction_test
+) %>%
+  select(Test, chisq, df, p_value, P_label)
+
+print(test_results)
+cat("\n")
+
+p_overall_x1 <- test_results %>% filter(Test == "Overall association: circadian misalignment") %>% pull(P_label)
+p_overall_x2 <- test_results %>% filter(Test == "Overall association: weekday sleep duration") %>% pull(P_label)
+p_nonlin_x1  <- test_results %>% filter(Test == "Non-linearity: circadian misalignment") %>% pull(P_label)
+p_nonlin_x2  <- test_results %>% filter(Test == "Non-linearity: weekday sleep duration") %>% pull(P_label)
+p_interact   <- test_results %>% filter(Test == "Interaction: circadian misalignment x sleep duration") %>% pull(P_label)
+
+# ==============================================================================
+# 9. Reference row for adjusted prediction
+# ==============================================================================
+
+baseline_row <- make_reference_row(mi_joint_datasets[[1]])
+
+# RHS formula for model.matrix
+rhs_joint <- as.formula(
+  paste(
+    "~ x1_lin + x1_nonlin1 + x2_lin + x2_nonlin1 +",
+    adj_covs
+  )
+)
+
+# ==============================================================================
+# 10. Marginal prediction for exposure 1
+# ==============================================================================
+
+x1_seq <- seq(
+  quantile(mi_joint_datasets[[1]][[EXPOSURE1_VAR]], 0.01, na.rm = TRUE),
+  quantile(mi_joint_datasets[[1]][[EXPOSURE1_VAR]], 0.99, na.rm = TRUE),
+  length.out = 200
+)
+
+newdata_x1 <- baseline_row[rep(1, length(x1_seq)), , drop = FALSE]
+newdata_x1[[EXPOSURE1_VAR]] <- x1_seq
+newdata_x1[[EXPOSURE2_VAR]] <- ref_x2
+
+basis_x1 <- build_rcs3_basis_df(newdata_x1[[EXPOSURE1_VAR]], knots_x1, "x1")
+basis_x2 <- build_rcs3_basis_df(newdata_x1[[EXPOSURE2_VAR]], knots_x2, "x2")
+newdata_x1 <- bind_cols(newdata_x1, basis_x1, basis_x2)
+
+refdata_x1 <- baseline_row
+refdata_x1[[EXPOSURE1_VAR]] <- ref_x1
+refdata_x1[[EXPOSURE2_VAR]] <- ref_x2
+ref_basis_x1 <- build_rcs3_basis_df(refdata_x1[[EXPOSURE1_VAR]], knots_x1, "x1")
+ref_basis_x2 <- build_rcs3_basis_df(refdata_x1[[EXPOSURE2_VAR]], knots_x2, "x2")
+refdata_x1 <- bind_cols(refdata_x1, ref_basis_x1, ref_basis_x2)
+
+pred_x1 <- predict_pooled_or(pool_joint, newdata_x1, refdata_x1, rhs_joint)
+newdata_x1 <- bind_cols(newdata_x1, pred_x1)
+
+x1_nadir <- newdata_x1[[EXPOSURE1_VAR]][which.min(newdata_x1$OR)]
+
+# ==============================================================================
+# 11. Marginal prediction for exposure 2
+# ==============================================================================
+
+x2_seq <- seq(
+  quantile(mi_joint_datasets[[1]][[EXPOSURE2_VAR]], 0.01, na.rm = TRUE),
+  quantile(mi_joint_datasets[[1]][[EXPOSURE2_VAR]], 0.99, na.rm = TRUE),
+  length.out = 200
+)
+
+newdata_x2 <- baseline_row[rep(1, length(x2_seq)), , drop = FALSE]
+newdata_x2[[EXPOSURE1_VAR]] <- ref_x1
+newdata_x2[[EXPOSURE2_VAR]] <- x2_seq
+
+basis2_x1 <- build_rcs3_basis_df(newdata_x2[[EXPOSURE1_VAR]], knots_x1, "x1")
+basis2_x2 <- build_rcs3_basis_df(newdata_x2[[EXPOSURE2_VAR]], knots_x2, "x2")
+newdata_x2 <- bind_cols(newdata_x2, basis2_x1, basis2_x2)
+
+refdata_x2 <- baseline_row
+refdata_x2[[EXPOSURE1_VAR]] <- ref_x1
+refdata_x2[[EXPOSURE2_VAR]] <- ref_x2
+ref_basis2_x1 <- build_rcs3_basis_df(refdata_x2[[EXPOSURE1_VAR]], knots_x1, "x1")
+ref_basis2_x2 <- build_rcs3_basis_df(refdata_x2[[EXPOSURE2_VAR]], knots_x2, "x2")
+refdata_x2 <- bind_cols(refdata_x2, ref_basis2_x1, ref_basis2_x2)
+
+pred_x2 <- predict_pooled_or(pool_joint, newdata_x2, refdata_x2, rhs_joint)
+newdata_x2 <- bind_cols(newdata_x2, pred_x2)
+
+x2_nadir <- newdata_x2[[EXPOSURE2_VAR]][which.min(newdata_x2$OR)]
+
+# ==============================================================================
+# 12. Joint prediction grid for 2D heatmap
+# ==============================================================================
+
+x1_grid <- seq(
+  quantile(mi_joint_datasets[[1]][[EXPOSURE1_VAR]], 0.05, na.rm = TRUE),
+  quantile(mi_joint_datasets[[1]][[EXPOSURE1_VAR]], 0.95, na.rm = TRUE),
+  length.out = 60
+)
+
+x2_grid <- seq(
+  quantile(mi_joint_datasets[[1]][[EXPOSURE2_VAR]], 0.05, na.rm = TRUE),
+  quantile(mi_joint_datasets[[1]][[EXPOSURE2_VAR]], 0.95, na.rm = TRUE),
+  length.out = 60
+)
+
+grid_df <- expand.grid(
+  x1_raw = x1_grid,
+  x2_raw = x2_grid
+)
+
+names(grid_df)[1] <- EXPOSURE1_VAR
+names(grid_df)[2] <- EXPOSURE2_VAR
+
+grid_df <- baseline_row[rep(1, nrow(grid_df)), , drop = FALSE] %>%
+  bind_cols(expand.grid(
+    tmp1 = x1_grid,
+    tmp2 = x2_grid
+  ))
+
+names(grid_df)[(ncol(grid_df)-1):ncol(grid_df)] <- c(EXPOSURE1_VAR, EXPOSURE2_VAR)
+
+grid_basis_x1 <- build_rcs3_basis_df(grid_df[[EXPOSURE1_VAR]], knots_x1, "x1")
+grid_basis_x2 <- build_rcs3_basis_df(grid_df[[EXPOSURE2_VAR]], knots_x2, "x2")
+grid_df <- bind_cols(grid_df, grid_basis_x1, grid_basis_x2)
+
+ref_grid <- baseline_row
+ref_grid[[EXPOSURE1_VAR]] <- ref_x1
+ref_grid[[EXPOSURE2_VAR]] <- ref_x2
+ref_grid_basis_x1 <- build_rcs3_basis_df(ref_grid[[EXPOSURE1_VAR]], knots_x1, "x1")
+ref_grid_basis_x2 <- build_rcs3_basis_df(ref_grid[[EXPOSURE2_VAR]], knots_x2, "x2")
+ref_grid <- bind_cols(ref_grid, ref_grid_basis_x1, ref_grid_basis_x2)
+
+pred_grid <- predict_pooled_or(pool_joint, grid_df, ref_grid, rhs_joint)
+grid_df <- bind_cols(grid_df, pred_grid) %>%
+  mutate(log_OR = log(OR))
+
+max_abs <- quantile(abs(grid_df$log_OR), 0.97, na.rm = TRUE)
+clim <- c(-max_abs, max_abs)
+
+# ==============================================================================
+# 13. Figure A: marginal curve for exposure 1
+# ==============================================================================
+
+p_A <- ggplot(newdata_x1, aes(x = .data[[EXPOSURE1_VAR]], y = OR)) +
+  geom_ribbon(aes(ymin = LL, ymax = UL), fill = "#56B4E9", alpha = 0.30) +
+  geom_line(color = "#0072B2", linewidth = 1.2) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "grey40") +
+  geom_vline(xintercept = ref_x1, linetype = "dotted", color = "grey60", linewidth = 0.7) +
+  annotate(
+    "text",
+    x = Inf, y = Inf,
+    hjust = 1.15, vjust = 1.8,
+    label = paste0("P-nonlinear = ", p_nonlin_x1),
+    fontface = "italic", size = 3.8, color = "grey20"
+  ) +
+  coord_cartesian(
+    xlim = quantile(mi_joint_datasets[[1]][[EXPOSURE1_VAR]], c(0.05, 0.95), na.rm = TRUE),
+    ylim = c(0.4, 2.4)
+  ) +
+  scale_y_continuous(breaks = c(0.5, 1.0, 1.5, 2.0)) +
+  theme_classic(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    axis.title = element_text(size = 11),
+    plot.margin = margin(8, 14, 8, 8)
+  ) +
+  labs(
+    x = "Circadian Misalignment",
+    y = "Adjusted OR (95% CI)",
+    title = "a"
+  )
+
+# ==============================================================================
+# 14. Figure B: marginal curve for exposure 2
+# ==============================================================================
+
+p_B <- ggplot(newdata_x2, aes(x = .data[[EXPOSURE2_VAR]], y = OR)) +
+  geom_ribbon(aes(ymin = LL, ymax = UL), fill = "#F0E442", alpha = 0.35) +
+  geom_line(color = "#D55E00", linewidth = 1.2) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "grey40") +
+  geom_vline(xintercept = ref_x2, linetype = "dotted", color = "grey60", linewidth = 0.7) +
+  annotate(
+    "text",
+    x = Inf, y = Inf,
+    hjust = 1.10, vjust = 1.8,
+    label = paste0("P-nonlinear = ", p_nonlin_x2),
+    fontface = "italic", size = 3.8, color = "grey20"
+  ) +
+  coord_cartesian(
+    xlim = quantile(mi_joint_datasets[[1]][[EXPOSURE2_VAR]], c(0.05, 0.95), na.rm = TRUE),
+    ylim = c(0.4, 2.4)
+  ) +
+  scale_y_continuous(breaks = c(0.5, 1.0, 1.5, 2.0)) +
+  theme_classic(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    axis.title = element_text(size = 11),
+    plot.margin = margin(8, 14, 8, 8)
+  ) +
+  labs(
+    x = "Weekday Sleep Duration (hours)",
+    y = "Adjusted OR (95% CI)",
+    title = "b"
+  )
+
+# ==============================================================================
+# 15. Figure C: 2D contour heatmap
+# ==============================================================================
+
+x_lo <- quantile(mi_joint_datasets[[1]][[EXPOSURE1_VAR]], 0.05, na.rm = TRUE)
+x_hi <- quantile(mi_joint_datasets[[1]][[EXPOSURE1_VAR]], 0.95, na.rm = TRUE)
+y_lo <- quantile(mi_joint_datasets[[1]][[EXPOSURE2_VAR]], 0.05, na.rm = TRUE)
+y_hi <- quantile(mi_joint_datasets[[1]][[EXPOSURE2_VAR]], 0.95, na.rm = TRUE)
+
+p_interact_plain <- ifelse(
+  grepl("<", p_interact),
+  "P-interaction < 0.001",
+  paste0("P-interaction = ", p_interact)
+)
+
+contour_breaks  <- c(1.00, 1.20, 1.50)
+contour_colours <- c("#FFFFFF", "#FFD700", "#CC0099")
+contour_ltypes  <- c("dashed", "solid", "solid")
+contour_lwd     <- c(1.1, 1.0, 1.0)
+contour_labels  <- c("OR=1.00", "OR=1.20", "OR=1.50")
+label_colours   <- c("grey15", "#C8A800", "#CC0099")
+
+find_label_pos <- function(target_or, grid, x_var, y_var, x_frac = 0.5, y_nudge = 0.12) {
+  x_range  <- range(grid[[x_var]], na.rm = TRUE)
+  x_target <- x_range[1] + x_frac * diff(x_range)
+  x_vals   <- unique(grid[[x_var]])
+  x_use    <- x_vals[which.min(abs(x_vals - x_target))]
+  sub      <- grid[abs(grid[[x_var]] - x_use) < 1e-6, ]
+  idx      <- which.min(abs(sub$OR - target_or))
+  list(
+    x = sub[[x_var]][idx],
+    y = sub[[y_var]][idx] + y_nudge
+  )
+}
+
+lab_10 <- find_label_pos(1.00, grid_df, EXPOSURE1_VAR, EXPOSURE2_VAR, x_frac = 0.45, y_nudge = 0.18)
+lab_12 <- find_label_pos(1.20, grid_df, EXPOSURE1_VAR, EXPOSURE2_VAR, x_frac = 0.65, y_nudge = 0.22)
+lab_15 <- find_label_pos(1.50, grid_df, EXPOSURE1_VAR, EXPOSURE2_VAR, x_frac = 0.80, y_nudge = 0.28)
+
+p_C <- ggplot(grid_df, aes(x = .data[[EXPOSURE1_VAR]], y = .data[[EXPOSURE2_VAR]])) +
+  geom_tile(aes(fill = log_OR)) +
+  geom_contour(aes(z = OR), breaks = 1.00,
+               color = contour_colours[1], linetype = contour_ltypes[1],
+               linewidth = contour_lwd[1]) +
+  geom_contour(aes(z = OR), breaks = 1.20,
+               color = contour_colours[2], linetype = contour_ltypes[2],
+               linewidth = contour_lwd[2]) +
+  geom_contour(aes(z = OR), breaks = 1.50,
+               color = contour_colours[3], linetype = contour_ltypes[3],
+               linewidth = contour_lwd[3]) +
+  annotate("text", x = lab_10$x, y = lab_10$y, label = "OR=1.00",
+           color = label_colours[1], size = 2.8, fontface = "bold") +
+  annotate("text", x = lab_12$x, y = lab_12$y, label = "OR=1.20",
+           color = label_colours[2], size = 2.8, fontface = "bold") +
+  annotate("text", x = lab_15$x, y = lab_15$y, label = "OR=1.50",
+           color = label_colours[3], size = 2.8, fontface = "bold") +
+  geom_vline(xintercept = ref_x1, linetype = "dashed", color = "white",
+             linewidth = 0.75, alpha = 0.85) +
+  geom_hline(yintercept = ref_x2, linetype = "dashed", color = "white",
+             linewidth = 0.75, alpha = 0.85) +
+  annotate("point", x = ref_x1, y = ref_x2,
+           size = 2.8, shape = 21, fill = "white", color = "black") +
+  scale_fill_gradientn(
+    colours = c("#053061", "#2166AC", "#92C5DE",
+                "#F7F7F7",
+                "#F1A340", "#E08214", "#7F3B08"),
+    limits = clim,
+    name = "log(OR)\nvs. median",
+    guide = guide_colorbar(
+      barheight = unit(5, "cm"),
+      barwidth  = unit(0.5, "cm"),
+      title.hjust = 0.5
+    )
+  ) +
+  coord_cartesian(xlim = c(x_lo, x_hi), ylim = c(y_lo, y_hi), clip = "on") +
+  theme_classic(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    plot.subtitle = element_text(face = "italic", size = 11,
+                                 color = "black", hjust = 0.9,
+                                 margin = margin(t = 2, b = 6)),
+    axis.title = element_text(size = 11),
+    legend.title = element_text(size = 10, hjust = 0.5),
+    legend.text = element_text(size = 9),
+    legend.position = "right",
+    plot.margin = margin(8, 12, 8, 8)
+  ) +
+  labs(
+    x = "Circadian Misalignment",
+    y = "Weekday Sleep Duration (hours)",
+    title = "c",
+    subtitle = p_interact_plain
+  )
+
+# ==============================================================================
+# 16. Combine and save
+# ==============================================================================
+
+caption_text <- paste0(
+  "Reference: both exposures fixed at the population median (white crosshair, panel c). ",
+  "Panel a shows the pooled marginal association between circadian misalignment and depression; ",
+  "panel b shows the pooled marginal association for weekday sleep duration; ",
+  "panel c shows the pooled joint predicted log(OR) surface across the 5th-95th percentile range of both exposures. ",
+  "Contour lines indicate OR thresholds of 1.00, 1.20, and 1.50. ",
+  "All models were survey-weighted and fitted across multiply imputed datasets, with pooled coefficients and covariance matrices combined using Rubin's rules. ",
+  "Outcome: PHQ-8 >= 10."
+)
+
+combined_fig <- (p_A | p_B) / p_C +
+  plot_annotation(
+    caption = caption_text,
+    theme = theme(
+      plot.caption = element_text(
+        size = 8.2, hjust = 0, color = "grey35",
+        margin = margin(t = 10)
+      )
+    )
+  )
+
+print(combined_fig)
+
+ggsave(
+  filename = output_png,
+  plot = combined_fig,
+  width = 14,
+  height = 12,
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  filename = output_pdf,
+  plot = combined_fig,
+  width = 14,
+  height = 12,
+  device = cairo_pdf
+)
+
+cat("\n[Done] Figure saved to:", output_png, "\n")
+cat("[Done] Figure saved to:", output_pdf, "\n")
+
+# ==============================================================================
+# 17. Report nadirs and pooled P-values
+# ==============================================================================
+
+cat("\n--- Nadir Points (minimum OR on pooled marginal curves) ---\n")
+cat(sprintf("  %s nadir   : %.3f\n", EXPOSURE1_VAR, x1_nadir))
+cat(sprintf("  %s nadir   : %.3f hours\n", EXPOSURE2_VAR, x2_nadir))
+cat(sprintf("  P-overall (%s)       : %s\n", EXPOSURE1_VAR, p_overall_x1))
+cat(sprintf("  P-nonlinear (%s)     : %s\n", EXPOSURE1_VAR, p_nonlin_x1))
+cat(sprintf("  P-overall (%s)       : %s\n", EXPOSURE2_VAR, p_overall_x2))
+cat(sprintf("  P-nonlinear (%s)     : %s\n", EXPOSURE2_VAR, p_nonlin_x2))
+cat(sprintf("  P-interaction        : %s\n", p_interact))
+
+# ==============================================================================
+# 18. Store objects in memory
+# ==============================================================================
+
+analysis_objects_joint_rcs_ge10 <- list(
+  knots_x1 = knots_x1,
+  knots_x2 = knots_x2,
+  ref_x1 = ref_x1,
+  ref_x2 = ref_x2,
+  pool_joint = pool_joint,
+  pool_interaction = pool_interaction,
+  test_results = test_results,
+  newdata_x1 = newdata_x1,
+  newdata_x2 = newdata_x2,
+  grid_df = grid_df,
+  x1_nadir = x1_nadir,
+  x2_nadir = x2_nadir,
+  plot_object = combined_fig
+)
+
+cat("\nKey joint RCS analysis objects have been created in memory.\n")
+cat("============================================================\n")
+cat("JOINT RCS ANALYSIS COMPLETED SUCCESSFULLY: PHQ-8 >= 10\n")
+cat("============================================================\n")
+
+# ==============================================================================
+# 19. Final publication-ready export for sensitivity analysis
+#    Journal-style figure output based on MI-pooled results
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 19.1 Output directory
+# ------------------------------------------------------------------------------
+
+output_dir_pub <- file.path(base_path, "photo_sensitivity")
+if (!dir.exists(output_dir_pub)) {
+  dir.create(output_dir_pub, recursive = TRUE)
+}
+
+# ------------------------------------------------------------------------------
+# 19.2 Publication theme
+# ------------------------------------------------------------------------------
+
+theme_pub_final <- theme_classic(base_size = 18) +
+  theme(
+    plot.title      = element_text(size = 18, face = "bold", hjust = 0.02),
+    plot.subtitle   = element_text(size = 13, face = "plain", hjust = 0.98, color = "black"),
+    axis.title      = element_text(size = 16, face = "bold", color = "black"),
+    axis.text       = element_text(size = 13, color = "black"),
+    legend.title    = element_text(size = 12, face = "bold"),
+    legend.text     = element_text(size = 11, color = "black"),
+    strip.text      = element_text(size = 13, face = "bold"),
+    plot.margin     = margin(12, 12, 12, 12),
+    panel.border    = element_blank()
+  )
+
+# ------------------------------------------------------------------------------
+# 19.3 Standardized P-value labels
+# ------------------------------------------------------------------------------
+
+p_nonlin_x1_final <- ifelse(
+  is.na(p_nonlin_x1), 
+  "P for nonlinearity = NA",
+  ifelse(
+    grepl("<", p_nonlin_x1),
+    "P for nonlinearity < 0.001",
+    paste0("P for nonlinearity = ", p_nonlin_x1)
+  )
+)
+
+p_nonlin_x2_final <- ifelse(
+  is.na(p_nonlin_x2), 
+  "P for nonlinearity = NA",
+  ifelse(
+    grepl("<", p_nonlin_x2),
+    "P for nonlinearity < 0.001",
+    paste0("P for nonlinearity = ", p_nonlin_x2)
+  )
+)
+
+p_interact_final <- ifelse(
+  is.na(p_interact), 
+  "P for interaction = NA",
+  ifelse(
+    grepl("<", p_interact),
+    "P for interaction < 0.001",
+    paste0("P for interaction = ", p_interact)
+  )
+)
+
+# ------------------------------------------------------------------------------
+# 19.4 Final Figure A
+# ------------------------------------------------------------------------------
+
+fig_A_tiff <- ggplot(newdata_x1, aes(x = .data[[EXPOSURE1_VAR]], y = OR)) +
+  geom_ribbon(
+    aes(ymin = LL, ymax = UL),
+    fill = "#009E73", alpha = 0.28
+  ) +
+  geom_line(color = "#66C2A4", linewidth = 1.25) +
+  geom_hline(
+    yintercept = 1,
+    linetype = "dashed", color = "grey40", linewidth = 0.7
+  ) +
+  geom_vline(
+    xintercept = ref_x1,
+    linetype = "dotted", color = "grey60", linewidth = 0.7
+  ) +
+  annotate(
+    "text",
+    x = Inf, y = Inf,
+    hjust = 1.02, vjust = 1.3,
+    label = p_nonlin_x1_final,
+    size = 4.3, color = "grey20", fontface = "plain"
+  ) +
+  coord_cartesian(
+    xlim = quantile(mi_joint_datasets[[1]][[EXPOSURE1_VAR]], c(0.05, 0.95), na.rm = TRUE),
+    ylim = c(0.4, 2.5)
+  ) +
+  scale_y_continuous(breaks = c(0.5, 1.0, 1.5, 2.0)) +
+  labs(
+    title = "A",
+    x = EXPOSURE1_LAB,
+    y = "Adjusted Odds Ratio (95% CI)"
+  ) +
+  theme_pub_final +
+  theme(legend.position = "none")
+
+# ------------------------------------------------------------------------------
+# 19.5 Final Figure B
+# ------------------------------------------------------------------------------
+
+fig_B_tiff <- ggplot(newdata_x2, aes(x = .data[[EXPOSURE2_VAR]], y = OR)) +
+  geom_ribbon(
+    aes(ymin = LL, ymax = UL),
+    fill = "#F0E442", alpha = 0.35
+  ) +
+  geom_line(color = "#D55E00", linewidth = 1.25) +
+  geom_hline(
+    yintercept = 1,
+    linetype = "dashed", color = "grey40", linewidth = 0.7
+  ) +
+  geom_vline(
+    xintercept = ref_x2,
+    linetype = "dotted", color = "grey60", linewidth = 0.7
+  ) +
+  annotate(
+    "text",
+    x = Inf, y = Inf,
+    hjust = 1.02, vjust = 1.3,
+    label = p_nonlin_x2_final,
+    size = 4.3, color = "grey20", fontface = "plain"
+  ) +
+  coord_cartesian(
+    xlim = quantile(mi_joint_datasets[[1]][[EXPOSURE2_VAR]], c(0.05, 0.95), na.rm = TRUE),
+    ylim = c(0.4, 2.5)
+  ) +
+  scale_y_continuous(breaks = c(0.5, 1.0, 1.5, 2.0)) +
+  labs(
+    title = "B",
+    x = EXPOSURE2_LAB,
+    y = "Adjusted Odds Ratio (95% CI)"
+  ) +
+  theme_pub_final +
+  theme(legend.position = "none")
+
+# ------------------------------------------------------------------------------
+# 19.6 Final Figure C
+# ------------------------------------------------------------------------------
+
+x_lo <- quantile(mi_joint_datasets[[1]][[EXPOSURE1_VAR]], 0.05, na.rm = TRUE)
+x_hi <- quantile(mi_joint_datasets[[1]][[EXPOSURE1_VAR]], 0.95, na.rm = TRUE)
+y_lo <- quantile(mi_joint_datasets[[1]][[EXPOSURE2_VAR]], 0.05, na.rm = TRUE)
+y_hi <- quantile(mi_joint_datasets[[1]][[EXPOSURE2_VAR]], 0.95, na.rm = TRUE)
+
+contour_colours <- c("#FFFFFF", "#FFD700", "#CC0099")
+contour_ltypes  <- c("dashed", "solid", "solid")
+contour_lwd     <- c(1.1, 1.0, 1.0)
+contour_labels  <- c("OR = 1.00", "OR = 1.20", "OR = 1.50")
+label_colours   <- c("grey15", "#B38F00", "#CC0099")
+
+find_label_pos_pub <- function(target_or, grid, x_var, y_var, x_frac = 0.5, y_nudge = 0.12) {
+  x_range  <- range(grid[[x_var]], na.rm = TRUE)
+  x_target <- x_range[1] + x_frac * diff(x_range)
+  x_vals   <- unique(grid[[x_var]])
+  x_use    <- x_vals[which.min(abs(x_vals - x_target))]
+  sub      <- grid[abs(grid[[x_var]] - x_use) < 1e-6, ]
+  idx      <- which.min(abs(sub$OR - target_or))
+  list(
+    x = sub[[x_var]][idx],
+    y = sub[[y_var]][idx] + y_nudge
+  )
+}
+
+lab_10_pub <- find_label_pos_pub(1.00, grid_df, EXPOSURE1_VAR, EXPOSURE2_VAR, x_frac = 0.45, y_nudge = 0.18)
+lab_12_pub <- find_label_pos_pub(1.20, grid_df, EXPOSURE1_VAR, EXPOSURE2_VAR, x_frac = 0.65, y_nudge = 0.22)
+lab_15_pub <- find_label_pos_pub(1.50, grid_df, EXPOSURE1_VAR, EXPOSURE2_VAR, x_frac = 0.80, y_nudge = 0.28)
+
+fig_C_tiff <- ggplot(grid_df, aes(x = .data[[EXPOSURE1_VAR]], y = .data[[EXPOSURE2_VAR]])) +
+  geom_tile(aes(fill = log_OR)) +
+  geom_contour(
+    aes(z = OR), breaks = 1.00,
+    color = contour_colours[1], linetype = contour_ltypes[1],
+    linewidth = contour_lwd[1]
+  ) +
+  geom_contour(
+    aes(z = OR), breaks = 1.20,
+    color = contour_colours[2], linetype = contour_ltypes[2],
+    linewidth = contour_lwd[2]
+  ) +
+  geom_contour(
+    aes(z = OR), breaks = 1.50,
+    color = contour_colours[3], linetype = contour_ltypes[3],
+    linewidth = contour_lwd[3]
+  ) +
+  annotate(
+    "text",
+    x = lab_10_pub$x, y = lab_10_pub$y, label = contour_labels[1],
+    color = label_colours[1], size = 3.5, fontface = "bold", hjust = 0.5
+  ) +
+  annotate(
+    "text",
+    x = lab_12_pub$x, y = lab_12_pub$y, label = contour_labels[2],
+    color = label_colours[2], size = 3.5, fontface = "bold", hjust = 0.5
+  ) +
+  annotate(
+    "text",
+    x = lab_15_pub$x, y = lab_15_pub$y, label = contour_labels[3],
+    color = label_colours[3], size = 3.5, fontface = "bold", hjust = 0.5
+  ) +
+  geom_vline(
+    xintercept = ref_x1,
+    linetype = "dashed", color = "white", linewidth = 0.75, alpha = 0.85
+  ) +
+  geom_hline(
+    yintercept = ref_x2,
+    linetype = "dashed", color = "white", linewidth = 0.75, alpha = 0.85
+  ) +
+  annotate(
+    "point",
+    x = ref_x1, y = ref_x2,
+    size = 3.0, shape = 21, fill = "white", color = "black"
+  ) +
+  annotate(
+    "text",
+    x = Inf, y = Inf,
+    hjust = 1.01, vjust = 1.2,
+    label = p_interact_final,
+    size = 4.1, color = "black", fontface = "plain"
+  ) +
+  scale_fill_gradientn(
+    colours = c(
+      "#053061", "#2166AC", "#92C5DE",
+      "#F7F7F7",
+      "#F1A340", "#E08214", "#7F3B08"
+    ),
+    limits = clim,
+    name = "log(OR)\nvs median",
+    guide = guide_colorbar(
+      barheight = unit(5, "cm"),
+      barwidth  = unit(0.55, "cm"),
+      title.hjust = 0.5
+    )
+  ) +
+  coord_cartesian(
+    xlim = c(x_lo, x_hi),
+    ylim = c(y_lo, y_hi),
+    clip = "on"
+  ) +
+  labs(
+    title = "C",
+    x = EXPOSURE1_LAB,
+    y = EXPOSURE2_LAB
+  ) +
+  theme_pub_final +
+  theme(legend.position = "right")
+
+# ------------------------------------------------------------------------------
+# 19.7 Print figures
+# ------------------------------------------------------------------------------
+
+print(fig_A_tiff)
+print(fig_B_tiff)
+print(fig_C_tiff)
+
+# ------------------------------------------------------------------------------
+# 19.8 Export separate TIFF files
+# ------------------------------------------------------------------------------
+
+ggsave(
+  filename = file.path(output_dir_pub, "Figure_Sensitivity_A.tiff"),
+  plot = fig_A_tiff,
+  device = "tiff",
+  width = 7.2,
+  height = 5.6,
+  units = "in",
+  dpi = 600,
+  compression = "lzw",
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(output_dir_pub, "Figure_Sensitivity_B.tiff"),
+  plot = fig_B_tiff,
+  device = "tiff",
+  width = 7.2,
+  height = 5.6,
+  units = "in",
+  dpi = 600,
+  compression = "lzw",
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(output_dir_pub, "Figure_Sensitivity_C.tiff"),
+  plot = fig_C_tiff,
+  device = "tiff",
+  width = 8.2,
+  height = 6.8,
+  units = "in",
+  dpi = 300,
+  compression = "lzw",
+  bg = "white"
+)
+
+cat("\n[Done] Separate TIFF files exported successfully.\n")
+cat(file.path(output_dir_pub, "Figure_Sensitivity_A.tiff"), "\n")
+cat(file.path(output_dir_pub, "Figure_Sensitivity_B.tiff"), "\n")
+cat(file.path(output_dir_pub, "Figure_Sensitivity_C.tiff"), "\n")
+
+# ------------------------------------------------------------------------------
+# 19.9 Final combined figure
+# ------------------------------------------------------------------------------
+
+Figure_Sensitivity_final <- fig_A_tiff / fig_B_tiff / fig_C_tiff +
+  plot_layout(heights = c(1, 1, 1.25))
+
+print(Figure_Sensitivity_final)
+
+ggsave(
+  filename = file.path(output_dir_pub, "Figure_Sensitivity_Combined.tiff"),
+  plot = Figure_Sensitivity_final,
+  device = "tiff",
+  width = 8.6,
+  height = 16.5,
+  units = "in",
+  dpi = 300,
+  compression = "lzw",
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(output_dir_pub, "Figure_Sensitivity_Combined.pdf"),
+  plot = Figure_Sensitivity_final,
+  device = cairo_pdf,
+  width = 8.6,
+  height = 16.5,
+  units = "in",
+  bg = "white"
+)
+
+cat("\n[Done] Final combined figure exported successfully.\n")
+cat(file.path(output_dir_pub, "Figure_Sensitivity_Combined.tiff"), "\n")
+cat(file.path(output_dir_pub, "Figure_Sensitivity_Combined.pdf"), "\n")
