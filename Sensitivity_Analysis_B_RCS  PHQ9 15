@@ -1,0 +1,509 @@
+################################################################################
+# STUDY: Multidimensional Circadian Misalignment and Depression
+# ANALYSIS: Survey-weighted Restricted Cubic Splines (RCS) - Multivariable Models
+################################################################################
+
+library(survey)
+library(rms)
+library(ggplot2)
+library(dplyr)
+library(stringr)
+library(cowplot)
+
+# Load the provided weighting engine
+source("D:/code/svyggrcs1.8R.R")
+
+# 1. Data Acquisition & Academic Factorization ---------------------------------
+nhanes_data <- readRDS("D:/code/17.Dataset.rds")
+
+# Ensure categorical variables have formal labels for publication
+nhanes_data <- nhanes_data %>%
+  mutate(
+    RIAGENDR = factor(RIAGENDR, levels = c(1, 2), labels = c("Male", "Female")),
+    RIDRETH1 = factor(RIDRETH1, levels = 1:5, 
+                      labels = c("Mexican American", "Other Hispanic", "Non-Hispanic White", 
+                                 "Non-Hispanic Black", "Other Race")),
+    DMDEDUC2 = factor(DMDEDUC2, levels = 1:5,
+                      labels = c("< 9th Grade", "9-11th Grade", "High School Graduate", 
+                                 "Some College", "College Graduate")),
+    smoke_status = factor(smoke_status, levels = c(0, 1, 2), 
+                          labels = c("Never Smoker", "Former Smoker", "Current Smoker")),
+    DMDMARTZ = factor(DMDMARTZ, levels = 1:3, 
+                      labels = c("Married", "Widowed/Divorced/Separated", "Never Married")),
+    AlcoholCategory = factor(Alcohol_Status, levels = 0:2, 
+                             labels = c("Never", "Light/Moderate", "Heavy")),
+    diabetes_status = factor(diabetes_status, levels = 0:1, 
+                             labels = c("No", "Borderline/Yes")),
+    hypertension_status = factor(htn_status, levels = 0:1, labels = c("No", "Yes")),
+    work_status = factor(work_status, levels = 0:1, labels = c("Working", "Not Working"))
+  )
+
+# 2. Survey Design Specification -----------------------------------------------
+options(survey.lonely.psu = "adjust")
+design <- svydesign(id = ~SDMVPSU, strata = ~SDMVSTRA, weights = ~mec_adj, data = nhanes_data, nest = TRUE)
+
+# 3. Global rms Environment Setup ----------------------------------------------
+# datadist is required for calculating the reference point (OR=1.0)
+dd <- datadist(nhanes_data)
+options(datadist = "dd")
+
+# 4. Modeling Strategy ---------------------------------------------------------
+
+# Model 1: Crude Model (Unadjusted)
+fit_m1 <- svyglm(ModSevere_depression_above ~ rcs(CMB_Score, 4), 
+                 design = design, family = quasibinomial())
+
+# Model 2: Adjusted for Demographic Characteristics
+fit_m2 <- svyglm(ModSevere_depression_above ~ rcs(CMB_Score, 4) + 
+                   RIDAGEYR + RIAGENDR + RIDRETH1, 
+                 design = design, family = quasibinomial())
+
+# Model 3: Adjusted for Lifestyle, Comorbidities, and Socio-economics
+fit_m3 <- svyglm(ModSevere_depression_above ~ rcs(CMB_Score, 4) + 
+                   RIDAGEYR + RIAGENDR + RIDRETH1 + DMDEDUC2 + smoke_status + 
+                   DMDMARTZ + BMI_value + AlcoholCategory + diabetes_status + 
+                   hypertension_status + work_status + MET_total + INDFMPIR, 
+                 design = design, family = quasibinomial())
+
+# Model 4: Maximally Adjusted Model (Fully Adjusted)
+# Includes all previous variables + Sedentary Behavior
+fit_m4 <- svyglm(ModSevere_depression_above ~ rcs(CMB_Score, 4) + 
+                   RIDAGEYR + RIAGENDR + RIDRETH1 + DMDEDUC2 + smoke_status + 
+                   DMDMARTZ + BMI_value + AlcoholCategory + diabetes_status + 
+                   hypertension_status + work_status + MET_total + INDFMPIR + 
+                   sedentary_min, 
+                 design = design, family = quasibinomial())
+
+
+# 5. Non-linearity Visualization (Model 4) -------------------------------------
+rcs_results <- svyggrcs(
+  fit = fit_m1, 
+  boot = TRUE,           # Bootstrapping provides robust CIs for complex survey data
+  n.boot = 500,          # Recommended for final publication
+  ref = "median",        # Setting the reference OR=1.0 at the median CMB Score
+  xlab = "Multidimensional Circadian Misalignment (CMB) Score", 
+  ylab = "Adjusted Odds Ratio (95% CI)",
+  ggtitle = "Association between CMB Score and Depression",
+  dec = 4
+)
+
+rcs_results <- svyggrcs(
+  fit = fit_m2, 
+  boot = TRUE,           # Bootstrapping provides robust CIs for complex survey data
+  n.boot = 500,          # Recommended for final publication
+  ref = "median",        # Setting the reference OR=1.0 at the median CMB Score
+  xlab = "Multidimensional Circadian Misalignment (CMB) Score", 
+  ylab = "Adjusted Odds Ratio (95% CI)",
+  ggtitle = "Association between CMB Score and Depression",
+  dec = 4
+)
+
+rcs_results <- svyggrcs(
+  fit = fit_m3, 
+  boot = TRUE,           # Bootstrapping provides robust CIs for complex survey data
+  n.boot = 500,          # Recommended for final publication
+  ref = "median",        # Setting the reference OR=1.0 at the median CMB Score
+  xlab = "Multidimensional Circadian Misalignment (CMB) Score", 
+  ylab = "Adjusted Odds Ratio (95% CI)",
+  ggtitle = "Association between CMB Score and Depression",
+  dec = 4
+)
+
+
+# Define the target color
+target_color <- "#56B4E9" 
+
+# Generate the base object
+rcs_results <- svyggrcs(
+  fit = fit_m4, 
+  boot = TRUE,           
+  n.boot = 500,          
+  ref = "median",        
+  xlab = "Multidimensional Circadian Misalignment (CMB) Score", 
+  ylab = "Adjusted Odds Ratio (95% CI)",
+  ggtitle = "Dose-Response Association: CMB Score and Depression",
+  dec = 4
+)
+
+# FORCE COLOR OVERRIDE
+# We extract the data and rebuild the plot layers to ensure NO ghost colors remain.
+final_plot <- ggplot(rcs_results$newdat, aes(x = rcs_results$newdat[[1]], y = yhat)) +
+  # Draw the Confidence Interval Ribbon FIRST
+  geom_ribbon(aes(ymin = bootll, ymax = bootul), fill = target_color, alpha = 0.2) +
+  # Draw the main OR Line SECOND
+  geom_line(color = target_color, linewidth = 1.2) +
+  # Reference line at OR = 1.0
+  geom_hline(yintercept = 1, linetype = "dashed", color = "darkgray", linewidth = 0.8, alpha = 0.6) +
+  # Formal academic styling
+  labs(
+    x = "Circadian Misalignment Scoring",
+    y = "Adjusted Odds Ratio (95% CI)",
+    title = "Dose-Response Association: Circadian Misalignment Scoring and Depression"
+  ) +
+  theme_classic() + 
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    axis.title = element_text(face = "bold")
+  )
+
+# Display the final cleaned plot
+print(final_plot)
+
+# ==============================================================================
+# 6. RISK-ESCALATION POINT (CORRECTED DETERMINISTIC VERSION)
+# ==============================================================================
+
+pred_data <- rcs_results$newdat %>%
+  rename(CMB_value = 1) %>%
+  arrange(CMB_value)
+
+
+nadir_row <- pred_data %>%
+  filter(yhat == min(yhat)) %>%
+  slice(1)
+
+nadir_value <- nadir_row$CMB_value
+
+
+risk_escalation_row <- pred_data %>%
+  filter(CMB_value > nadir_value) %>%
+  filter(yhat >= 1.10) %>%
+  slice(1)
+
+if(nrow(risk_escalation_row) > 0) {
+  
+  risk_escalation_point <- risk_escalation_row$CMB_value
+  
+  cat("\n[Nadir Point]:", round(nadir_value, 4), "\n")
+  cat("[Risk-Escalation Point]: OR ≥ 1.10 detected at CMB Score =", 
+      round(risk_escalation_point, 4), "\n")
+  
+} else {
+  
+  risk_escalation_point <- NA
+  cat("\nNo OR ≥ 1.10 detected after nadir.\n")
+}
+
+# ==============================================================================
+# 7. CREATE CATEGORICAL EXPOSURE VARIABLE (REPRODUCIBLE)
+# ==============================================================================
+
+nhanes_data <- nhanes_data %>%
+  mutate(
+    CMB_Risk_Group = ifelse(CMB_Score >= risk_escalation_point, 1, 0),
+    CMB_Risk_Group = factor(
+      CMB_Risk_Group,
+      levels = c(0, 1),
+      labels = c(
+        paste0("Lower Exposure (<", round(risk_escalation_point, 2), ")"),
+        paste0("Higher Exposure (≥", round(risk_escalation_point, 2), ")")
+      )
+    )
+  )
+
+# Update survey design object
+design_updated <- update(design, 
+                         CMB_Risk_Group = nhanes_data$CMB_Risk_Group)
+
+# Validate counts
+cat("\n[Validation] Unweighted counts per exposure group:\n")
+print(table(nhanes_data$CMB_Risk_Group))
+
+
+# ==============================================================================
+# 8. SECONDARY ANALYSIS USING CATEGORIZED EXPOSURE
+# ==============================================================================
+
+fit_categorical <- svyglm(
+  ModSevere_depression_above ~ CMB_Risk_Group +
+    RIDAGEYR + RIAGENDR + RIDRETH1 + DMDEDUC2 + smoke_status +
+    DMDMARTZ + BMI_value + AlcoholCategory + diabetes_status +
+    hypertension_status + work_status + MET_total + INDFMPIR +
+    sedentary_min,
+  design = design_updated,
+  family = quasibinomial()
+)
+
+cat("\n--- Secondary Analysis (Categorized Exposure) ---\n")
+print(summary(fit_categorical))
+
+
+# ==============================================================================
+# 9. MODEL DIAGNOSTICS (UNCHANGED, NON-CAUSAL LANGUAGE)
+# ==============================================================================
+
+cat("\n--- Variance Inflation Factor (VIF) Assessment ---\n")
+
+vif_fit <- glm(
+  ModSevere_depression_above ~ 
+    CMB_Score + RIDAGEYR + RIAGENDR + RIDRETH1 + 
+    DMDEDUC2 + smoke_status + DMDMARTZ + BMI_value + 
+    AlcoholCategory + diabetes_status + hypertension_status + 
+    work_status + MET_total + INDFMPIR + sedentary_min,
+  data = nhanes_data,
+  family = binomial()
+)
+
+vif_results <- car::vif(vif_fit)
+print(vif_results)
+
+cat("\n--- Model Stability Check ---\n")
+
+res_dev <- residuals(fit_m4, type = "deviance")
+outlier_rate <- mean(abs(res_dev) > 2)
+
+cat(sprintf("Proportion of observations with |deviance residual| > 2: %.2f%%\n", 
+            outlier_rate * 100))
+
+
+# ==============================================================================
+# 10. DATA EXPORT
+# ==============================================================================
+
+saveRDS(nhanes_data, "D:/code/18.2 Dataset.rds")
+
+cat("\n[Status]: Dataset successfully exported.\n")
+cat(sprintf("[Final Risk-Escalation Point]: %.4f\n", risk_escalation_point))
+
+# ==============================================================================
+# Sensitivity Analysis Figure B. Restricted cubic spline association between
+# cumulative circadian misalignment score and moderate-to-severe depressive
+# symptoms (ModSevere threshold)
+# (Model 4, final submission version, corrected P-value version)
+#
+# Output:
+#   D:/code/photo/Sensitivity_Analysis_B_RCS.tiff
+#   D:/code/photo/Sensitivity_Analysis_B_RCS.png
+#   D:/code/photo/Sensitivity_Analysis_B_RCS.pdf
+#
+# Journal requirements:
+#   - Pure English
+#   - No caption inside figure
+#   - No in-figure threshold-style emphasis
+#   - TIFF 600 dpi for submission
+#   - PNG 300 dpi for proof/review
+#   - Clean academic formatting
+# ==============================================================================
+
+library(ggplot2)
+library(dplyr)
+library(grid)
+
+# ------------------------------------------------------------------------------
+# 1. Rebuild Model 4 RCS prediction object
+# ------------------------------------------------------------------------------
+# Uses the existing fitted model object from the previous analysis script.
+rcs_results_m4 <- svyggrcs(
+  fit = fit_m4,
+  boot = TRUE,
+  n.boot = 500,
+  ref = "median",
+  xlab = "Cumulative circadian misalignment score (higher = greater misalignment)",
+  ylab = "Adjusted odds ratio (95% CI)",
+  dec = 4
+)
+
+# ------------------------------------------------------------------------------
+# 2. Prepare plotting data
+# ------------------------------------------------------------------------------
+plot_df <- as.data.frame(rcs_results_m4$newdat)
+
+# Rename the first column to a stable name
+names(plot_df)[1] <- "x"
+
+# Ensure numeric columns
+plot_df$x      <- as.numeric(as.character(plot_df$x))
+plot_df$yhat   <- as.numeric(as.character(plot_df$yhat))
+plot_df$bootll <- as.numeric(as.character(plot_df$bootll))
+plot_df$bootul <- as.numeric(as.character(plot_df$bootul))
+
+plot_df <- plot_df %>%
+  filter(!is.na(x), !is.na(yhat), !is.na(bootll), !is.na(bootul)) %>%
+  arrange(x)
+
+# ------------------------------------------------------------------------------
+# 3. Use the confirmed final manuscript P value directly
+# ------------------------------------------------------------------------------
+# IMPORTANT:
+# Replace the value below with the confirmed P for nonlinearity in
+# Sensitivity Analysis B before final submission.
+p_nonlinear_m4 <- 0.372
+
+p_label <- ifelse(
+  p_nonlinear_m4 < 0.001,
+  "P for nonlinearity < 0.001",
+  sprintf("P for nonlinearity = %.3f", p_nonlinear_m4)
+)
+
+# ------------------------------------------------------------------------------
+# 4. Plot settings
+# ------------------------------------------------------------------------------
+out_dir <- "D:/code/photo"
+if (!dir.exists(out_dir)) {
+  dir.create(out_dir, recursive = TRUE)
+}
+
+out_tiff <- file.path(out_dir, "Sensitivity_Analysis_B_RCS.tiff")
+out_png  <- file.path(out_dir, "Sensitivity_Analysis_B_RCS.png")
+out_pdf  <- file.path(out_dir, "Sensitivity_Analysis_B_RCS.pdf")
+
+col_line  <- "#009E73"
+alpha_rib <- 0.16
+base_size <- 11
+
+y_min <- min(plot_df$bootll, na.rm = TRUE)
+y_max <- max(plot_df$bootul, na.rm = TRUE)
+
+y_min_round <- floor(y_min * 10) / 10
+y_max_round <- ceiling(y_max * 10) / 10
+y_range <- y_max_round - y_min_round
+if (y_range <= 0) y_range <- 0.5
+y_pad <- max(0.04, y_range * 0.06)
+
+x_min <- min(plot_df$x, na.rm = TRUE)
+x_max <- max(plot_df$x, na.rm = TRUE)
+
+# ------------------------------------------------------------------------------
+# 5. Build final publication-ready sensitivity analysis figure
+# ------------------------------------------------------------------------------
+p_sensitivity_B <- ggplot(plot_df, aes(x = x, y = yhat)) +
+  geom_ribbon(
+    aes(ymin = bootll, ymax = bootul),
+    fill = col_line,
+    alpha = alpha_rib,
+    colour = NA
+  ) +
+  geom_line(
+    colour = col_line,
+    linewidth = 1.15
+  ) +
+  geom_hline(
+    yintercept = 1,
+    linetype = "dashed",
+    colour = "grey35",
+    linewidth = 0.6
+  ) +
+  
+  # Panel label
+  annotate(
+    "text",
+    x = x_min + 0.03 * (x_max - x_min),
+    y = y_max_round + y_pad * 0.72,
+    label = "B",
+    hjust = 0,
+    vjust = 1,
+    family = "Arial",
+    fontface = "bold",
+    size = 5
+  ) +
+  
+  # P-value annotation
+  annotate(
+    "text",
+    x = x_max - 0.02 * (x_max - x_min),
+    y = y_max_round + y_pad * 0.10,
+    label = p_label,
+    hjust = 1,
+    vjust = 1,
+    family = "Arial",
+    fontface = "plain",
+    size = 3.5,
+    colour = "black"
+  ) +
+  
+  scale_x_continuous(
+    name = "Cumulative circadian misalignment score (higher = greater misalignment)",
+    expand = expansion(mult = c(0.01, 0.01))
+  ) +
+  scale_y_continuous(
+    name = "Adjusted odds ratio (95% CI)",
+    limits = c(y_min_round - y_pad, y_max_round + y_pad),
+    expand = expansion(mult = c(0, 0))
+  ) +
+  
+  labs(
+    title = NULL,
+    subtitle = NULL,
+    caption = NULL
+  ) +
+  
+  theme_bw(base_size = base_size, base_family = "Arial") +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(colour = "black", linewidth = 0.7, fill = NA),
+    
+    axis.title = element_text(face = "bold", colour = "black", size = base_size),
+    axis.text  = element_text(colour = "black", size = base_size * 0.9),
+    axis.ticks = element_line(colour = "black", linewidth = 0.4),
+    axis.ticks.length = unit(2.5, "pt"),
+    
+    plot.title = element_blank(),
+    plot.subtitle = element_blank(),
+    plot.caption = element_blank(),
+    legend.position = "none",
+    
+    plot.margin = margin(t = 10, r = 10, b = 8, l = 8)
+  )
+
+# ------------------------------------------------------------------------------
+# 6. Export separate high-resolution files
+# ------------------------------------------------------------------------------
+ggsave(
+  filename = out_tiff,
+  plot = p_sensitivity_B,
+  device = "tiff",
+  dpi = 600,
+  width = 6.0,
+  height = 4.8,
+  units = "in",
+  compression = "lzw",
+  bg = "white"
+)
+
+ggsave(
+  filename = out_png,
+  plot = p_sensitivity_B,
+  device = "png",
+  dpi = 300,
+  width = 6.0,
+  height = 4.8,
+  units = "in",
+  bg = "white"
+)
+
+ggsave(
+  filename = out_pdf,
+  plot = p_sensitivity_B,
+  device = cairo_pdf,
+  width = 6.0,
+  height = 4.8,
+  units = "in",
+  bg = "white"
+)
+
+message(sprintf("[OK] Sensitivity analysis Figure B TIFF exported: %s", out_tiff))
+message(sprintf("[OK] Sensitivity analysis Figure B PNG exported: %s", out_png))
+message(sprintf("[OK] Sensitivity analysis Figure B PDF exported: %s", out_pdf))
+message("[DONE] Sensitivity analysis Figure B created successfully.")
+
+# Optional preview
+print(p_sensitivity_B)
+# ==============================================================================
+# 7. P-VALUE SUMMARY TABLE (BASED ON svyggrcs OUTPUT, 4-KNOT MODEL)
+# ==============================================================================
+
+# P values extracted from svyggrcs() console output and rounded to 4 decimals
+
+
+p_summary <- data.frame(
+  Model = c("Model 1", "Model 2", "Model 3", "Model 4"),
+  P_Overall = c("<0.001", "<0.001", "<0.001", "<0.001"),
+  P_Nonlinearity = c("0.321", "0.344", "0.375", "0.372"),
+  stringsAsFactors = FALSE
+)
+
+print(p_summary)
+write.csv(p_summary, "Sensitivity_Analysis_A_RCS_Pvalues.csv", row.names = FALSE)
+
+cat("\n[Status]: RCS (4 knots) P-value summary exported.\n")
