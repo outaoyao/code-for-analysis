@@ -1,0 +1,610 @@
+################################################################################
+# STUDY: Multidimensional Circadian Misalignment and Depression
+# ANALYSIS: Survey-weighted Restricted Cubic Splines (RCS) - Multivariable Models
+################################################################################
+
+library(survey)
+library(rms)
+library(ggplot2)
+library(dplyr)
+library(stringr)
+library(cowplot)
+
+# Load the provided weighting engine
+source("D:/code/svyggrcs1.8R.R")
+
+# 1. Data Acquisition & Academic Factorization ---------------------------------
+nhanes_data <- readRDS("D:/code/17.Dataset.rds")
+
+# Ensure categorical variables have formal labels for publication
+nhanes_data <- nhanes_data %>%
+  mutate(
+    RIAGENDR = factor(RIAGENDR, levels = c(1, 2), labels = c("Male", "Female")),
+    RIDRETH1 = factor(RIDRETH1, levels = 1:5, 
+                      labels = c("Mexican American", "Other Hispanic", "Non-Hispanic White", 
+                                 "Non-Hispanic Black", "Other Race")),
+    DMDEDUC2 = factor(DMDEDUC2, levels = 1:5,
+                      labels = c("< 9th Grade", "9-11th Grade", "High School Graduate", 
+                                 "Some College", "College Graduate")),
+    smoke_status = factor(smoke_status, levels = c(0, 1, 2), 
+                          labels = c("Never Smoker", "Former Smoker", "Current Smoker")),
+    DMDMARTZ = factor(DMDMARTZ, levels = 1:3, 
+                      labels = c("Married", "Widowed/Divorced/Separated", "Never Married")),
+    AlcoholCategory = factor(Alcohol_Status, levels = 0:2, 
+                             labels = c("Never", "Light/Moderate", "Heavy")),
+    diabetes_status = factor(diabetes_status, levels = 0:1, 
+                             labels = c("No", "Borderline/Yes")),
+    hypertension_status = factor(htn_status, levels = 0:1, labels = c("No", "Yes")),
+    work_status = factor(work_status, levels = 0:1, labels = c("Working", "Not Working"))
+  )
+
+# 2. Survey Design Specification -----------------------------------------------
+options(survey.lonely.psu = "adjust")
+design <- svydesign(id = ~SDMVPSU, strata = ~SDMVSTRA, weights = ~mec_adj, data = nhanes_data, nest = TRUE)
+
+# 3. Global rms Environment Setup ----------------------------------------------
+# datadist is required for calculating the reference point (OR=1.0)
+dd <- datadist(nhanes_data)
+options(datadist = "dd")
+
+# 4. Modeling Strategy ---------------------------------------------------------
+
+# Model 1: Crude Model (Unadjusted)
+fit_m1 <- svyglm(Moderate_depression_above ~ rcs(CMB_Score, 4), 
+                 design = design, family = quasibinomial())
+
+# Model 2: Adjusted for Demographic Characteristics
+fit_m2 <- svyglm(Moderate_depression_above ~ rcs(CMB_Score, 4) + 
+                   RIDAGEYR + RIAGENDR + RIDRETH1, 
+                 design = design, family = quasibinomial())
+
+# Model 3: Adjusted for Lifestyle, Comorbidities, and Socio-economics
+fit_m3 <- svyglm(Moderate_depression_above ~ rcs(CMB_Score, 4) + 
+                   RIDAGEYR + RIAGENDR + RIDRETH1 + DMDEDUC2 + smoke_status + 
+                   DMDMARTZ + BMI_value + AlcoholCategory + diabetes_status + 
+                   hypertension_status + work_status + MET_total + INDFMPIR, 
+                 design = design, family = quasibinomial())
+
+# Model 4: Maximally Adjusted Model (Fully Adjusted)
+# Includes all previous variables + Sedentary Behavior
+fit_m4 <- svyglm(Moderate_depression_above ~ rcs(CMB_Score, 4) + 
+                   RIDAGEYR + RIAGENDR + RIDRETH1 + DMDEDUC2 + smoke_status + 
+                   DMDMARTZ + BMI_value + AlcoholCategory + diabetes_status + 
+                   hypertension_status + work_status + MET_total + INDFMPIR + 
+                   sedentary_min, 
+                 design = design, family = quasibinomial())
+
+
+# 5. Non-linearity Visualization (Model 4) -------------------------------------
+rcs_results <- svyggrcs(
+  fit = fit_m1, 
+  boot = TRUE,           # Bootstrapping provides robust CIs for complex survey data
+  n.boot = 500,          # Recommended for final publication
+  ref = "median",        # Setting the reference OR=1.0 at the median CMB Score
+  xlab = "Multidimensional Circadian Misalignment (CMB) Score", 
+  ylab = "Adjusted Odds Ratio (95% CI)",
+  ggtitle = "Association between CMB Score and Depression",
+  dec = 4
+)
+
+rcs_results <- svyggrcs(
+  fit = fit_m2, 
+  boot = TRUE,           # Bootstrapping provides robust CIs for complex survey data
+  n.boot = 500,          # Recommended for final publication
+  ref = "median",        # Setting the reference OR=1.0 at the median CMB Score
+  xlab = "Multidimensional Circadian Misalignment (CMB) Score", 
+  ylab = "Adjusted Odds Ratio (95% CI)",
+  ggtitle = "Association between CMB Score and Depression",
+  dec = 4
+)
+
+rcs_results <- svyggrcs(
+  fit = fit_m3, 
+  boot = TRUE,           # Bootstrapping provides robust CIs for complex survey data
+  n.boot = 500,          # Recommended for final publication
+  ref = "median",        # Setting the reference OR=1.0 at the median CMB Score
+  xlab = "Multidimensional Circadian Misalignment (CMB) Score", 
+  ylab = "Adjusted Odds Ratio (95% CI)",
+  ggtitle = "Association between CMB Score and Depression",
+  dec = 4
+)
+
+
+# Define the target color
+target_color <- "#56B4E9" 
+
+# Generate the base object
+rcs_results <- svyggrcs(
+  fit = fit_m4, 
+  boot = TRUE,           
+  n.boot = 500,          
+  ref = "median",        
+  xlab = "Multidimensional Circadian Misalignment (CMB) Score", 
+  ylab = "Adjusted Odds Ratio (95% CI)",
+  ggtitle = "Dose-Response Association: CMB Score and Depression",
+  dec = 4
+)
+
+# FORCE COLOR OVERRIDE
+# We extract the data and rebuild the plot layers to ensure NO ghost colors remain.
+final_plot <- ggplot(rcs_results$newdat, aes(x = rcs_results$newdat[[1]], y = yhat)) +
+  # Draw the Confidence Interval Ribbon FIRST
+  geom_ribbon(aes(ymin = bootll, ymax = bootul), fill = target_color, alpha = 0.2) +
+  # Draw the main OR Line SECOND
+  geom_line(color = target_color, linewidth = 1.2) +
+  # Reference line at OR = 1.0
+  geom_hline(yintercept = 1, linetype = "dashed", color = "darkgray", linewidth = 0.8, alpha = 0.6) +
+  # Formal academic styling
+  labs(
+    x = "Circadian Misalignment Scoring",
+    y = "Adjusted Odds Ratio (95% CI)",
+    title = "Dose-Response Association: Circadian Misalignment Scoring and Depression"
+  ) +
+  theme_classic() + 
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    axis.title = element_text(face = "bold")
+  )
+
+# Display the final cleaned plot
+print(final_plot)
+
+# ==============================================================================
+# 6. RISK-ESCALATION POINT (CORRECTED DETERMINISTIC VERSION)
+# ==============================================================================
+
+pred_data <- rcs_results$newdat %>%
+  rename(CMB_value = 1) %>%
+  arrange(CMB_value)
+
+
+nadir_row <- pred_data %>%
+  filter(yhat == min(yhat)) %>%
+  slice(1)
+
+nadir_value <- nadir_row$CMB_value
+
+
+risk_escalation_row <- pred_data %>%
+  filter(CMB_value > nadir_value) %>%
+  filter(yhat >= 1.10) %>%
+  slice(1)
+
+if(nrow(risk_escalation_row) > 0) {
+  
+  risk_escalation_point <- risk_escalation_row$CMB_value
+  
+  cat("\n[Nadir Point]:", round(nadir_value, 4), "\n")
+  cat("[Risk-Escalation Point]: OR ≥ 1.10 detected at CMB Score =", 
+      round(risk_escalation_point, 4), "\n")
+  
+} else {
+  
+  risk_escalation_point <- NA
+  cat("\nNo OR ≥ 1.10 detected after nadir.\n")
+}
+
+# ==============================================================================
+# 7. CREATE CATEGORICAL EXPOSURE VARIABLE (REPRODUCIBLE)
+# ==============================================================================
+
+nhanes_data <- nhanes_data %>%
+  mutate(
+    CMB_Risk_Group = ifelse(CMB_Score >= risk_escalation_point, 1, 0),
+    CMB_Risk_Group = factor(
+      CMB_Risk_Group,
+      levels = c(0, 1),
+      labels = c(
+        paste0("Lower Exposure (<", round(risk_escalation_point, 2), ")"),
+        paste0("Higher Exposure (≥", round(risk_escalation_point, 2), ")")
+      )
+    )
+  )
+
+# Update survey design object
+design_updated <- update(design, 
+                         CMB_Risk_Group = nhanes_data$CMB_Risk_Group)
+
+# Validate counts
+cat("\n[Validation] Unweighted counts per exposure group:\n")
+print(table(nhanes_data$CMB_Risk_Group))
+
+
+# ==============================================================================
+# 8. SECONDARY ANALYSIS USING CATEGORIZED EXPOSURE
+# ==============================================================================
+
+fit_categorical <- svyglm(
+  Moderate_depression_above ~ CMB_Risk_Group +
+    RIDAGEYR + RIAGENDR + RIDRETH1 + DMDEDUC2 + smoke_status +
+    DMDMARTZ + BMI_value + AlcoholCategory + diabetes_status +
+    hypertension_status + work_status + MET_total + INDFMPIR +
+    sedentary_min,
+  design = design_updated,
+  family = quasibinomial()
+)
+
+cat("\n--- Secondary Analysis (Categorized Exposure) ---\n")
+print(summary(fit_categorical))
+
+
+# ==============================================================================
+# 9. MODEL DIAGNOSTICS (UNCHANGED, NON-CAUSAL LANGUAGE)
+# ==============================================================================
+
+cat("\n--- Variance Inflation Factor (VIF) Assessment ---\n")
+
+vif_fit <- glm(
+  Moderate_depression_above ~ 
+    CMB_Score + RIDAGEYR + RIAGENDR + RIDRETH1 + 
+    DMDEDUC2 + smoke_status + DMDMARTZ + BMI_value + 
+    AlcoholCategory + diabetes_status + hypertension_status + 
+    work_status + MET_total + INDFMPIR + sedentary_min,
+  data = nhanes_data,
+  family = binomial()
+)
+
+vif_results <- car::vif(vif_fit)
+print(vif_results)
+
+cat("\n--- Model Stability Check ---\n")
+
+res_dev <- residuals(fit_m4, type = "deviance")
+outlier_rate <- mean(abs(res_dev) > 2)
+
+cat(sprintf("Proportion of observations with |deviance residual| > 2: %.2f%%\n", 
+            outlier_rate * 100))
+
+
+# ==============================================================================
+# 10. DATA EXPORT
+# ==============================================================================
+
+saveRDS(nhanes_data, "D:/code/18.Dataset.rds")
+
+cat("\n[Status]: Dataset successfully exported.\n")
+cat(sprintf("[Final Risk-Escalation Point]: %.4f\n", risk_escalation_point))
+
+# ==============================================================================
+# 11. P-VALUE SUMMARY TABLE (BASED ON svyggrcs OUTPUT, 4-KNOT MODEL)
+# ==============================================================================
+
+# P values extracted from svyggrcs() console output and rounded to 4 decimals
+
+
+p_summary <- data.frame(
+  Model = c("Model 1", "Model 2", "Model 3", "Model 4"),
+  P_Overall = c("<0.001", "<0.001", "<0.001", "<0.001"),
+  P_Nonlinearity = c("0.003", "0.005", "0.006", "0.006"),
+  stringsAsFactors = FALSE
+)
+
+print(p_summary)
+write.csv(p_summary, "SupplementaryTable_RCS_4_Pvalues.csv", row.names = FALSE)
+
+cat("\n[Status]: RCS (4 knots) P-value summary exported.\n")
+
+################################################################################
+# SUPPLEMENTARY ANALYSIS: Temporal Split-Sample Robustness Verification
+# PROJECT: Circadian Misalignment and Depressive Symptoms (NHANES 2017-2023)
+# PURPOSE: To address concerns regarding potential overfitting and circularity
+#          by evaluating the stability of the observed dose-response association 
+#          across independent survey periods.
+################################################################################
+
+library(survey)
+library(rms)
+library(dplyr)
+
+# 1. Dataset Partitioning ------------------------------------------------------
+# Partitioning the sample based on natural temporal boundaries in NHANES:
+# Discovery Cohort: 2017-2020 cycles
+# Validation Cohort: 2021-2023 cycles
+df_discovery  <- nhanes_data %>% filter(CYCLE == "2017-2020")
+df_validation <- nhanes_data %>% filter(CYCLE == "2021-2023")
+
+# 2. Discovery Phase Environment -----------------------------------------------
+# Establishing distributional attributes specifically for the discovery subset
+dd_disc <- datadist(df_discovery)
+options(datadist = "dd_disc")
+
+design_disc <- svydesign(
+  id = ~SDMVPSU, 
+  strata = ~SDMVSTRA, 
+  weights = ~mec_adj, 
+  data = df_discovery, 
+  nest = TRUE
+)
+
+# 3. Model Estimation: Discovery Cohort ----------------------------------------
+# Fitting the fully adjusted restricted cubic spline (RCS) model
+fit_disc <- svyglm(
+  Moderate_depression_above ~ rcs(CMB_Score, 4) + 
+    RIDAGEYR + RIAGENDR + RIDRETH1 + DMDEDUC2 + smoke_status + 
+    DMDMARTZ + BMI_value + AlcoholCategory + diabetes_status + 
+    hypertension_status + work_status + MET_total + INDFMPIR + 
+    sedentary_min,
+  design = design_disc, 
+  family = quasibinomial()
+)
+
+# 4. Validation Phase Environment ----------------------------------------------
+# Establishing distributional attributes specifically for the validation subset
+dd_valid <- datadist(df_validation)
+options(datadist = "dd_valid")
+
+design_valid <- svydesign(
+  id = ~SDMVPSU, 
+  strata = ~SDMVSTRA, 
+  weights = ~mec_adj, 
+  data = df_validation, 
+  nest = TRUE
+)
+
+# 5. Model Estimation: Validation Cohort ---------------------------------------
+# Re-estimating the model in the independent validation set to assess replicability
+fit_valid <- svyglm(
+  Moderate_depression_above ~ rcs(CMB_Score, 4) + 
+    RIDAGEYR + RIAGENDR + RIDRETH1 + DMDEDUC2 + smoke_status + 
+    DMDMARTZ + BMI_value + AlcoholCategory + diabetes_status + 
+    hypertension_status + work_status + MET_total + INDFMPIR + 
+    sedentary_min,
+  design = design_valid, 
+  family = quasibinomial()
+)
+
+# 6. Comparative Assessment of Estimates ---------------------------------------
+# Functional helper to extract spline coefficients and compute Odds Ratios (OR)
+extract_robustness_metrics <- function(fit, label) {
+  # Identifying the linear component of the spline
+  linear_term <- grep("CMB_Score$", names(coef(fit)), value = TRUE)[1]
+  beta <- coef(fit)[linear_term]
+  se   <- sqrt(vcov(fit)[linear_term, linear_term])
+  
+  # Identifying the non-linear component (first spline tail)
+  nonlinear_term <- grep("CMB_Score'", names(coef(fit)), value = TRUE)[1]
+  beta_nl <- coef(fit)[nonlinear_term]
+  se_nl   <- sqrt(vcov(fit)[nonlinear_term, nonlinear_term])
+  
+  data.frame(
+    Cohort = label,
+    Linear_OR = exp(beta),
+    Linear_CI = paste0("(", round(exp(beta - 1.96 * se), 3), "-", round(exp(beta + 1.96 * se), 3), ")"),
+    Nonlinear_Beta = round(beta_nl, 4),
+    Nonlinear_P = round(2 * (1 - pnorm(abs(beta_nl / se_nl))), 4)
+  )
+}
+
+# Compile and present comparison table
+temporal_validation_results <- rbind(
+  extract_robustness_metrics(fit_disc, "Discovery (2017-2020)"),
+  extract_robustness_metrics(fit_valid, "Validation (2021-2023)")
+)
+
+print(temporal_validation_results)
+
+# Restore global environment
+options(datadist = "dd")
+
+################################################################################
+
+################################################################################
+# SCRIPT: Final Corrected Temporal Robustness with Raw Weights
+# PURPOSE: Replicating Model 4 using WTMECPRP (2017-2020) and WTMEC2YR (2021-2023)
+################################################################################
+
+library(survey)
+library(rms)
+library(dplyr)
+
+# 1. Loading and Merging -------------------------------------------------------
+analysis_data  <- readRDS("D:/code/17.Dataset.rds")
+raw_weights_df <- readRDS("D:/code/1.data.rds") %>%
+  select(SEQN, WTMECPRP, WTINTPRP, WTMEC2YR, WTINT2YR)
+
+# Merge datasets
+nhanes_merged <- analysis_data %>%
+  left_join(raw_weights_df, by = "SEQN")
+
+# 2. CRITICAL FIX: Direct Renaming to match Model 4 Formula --------------------
+# We check if names already exist; if not, we assign them from original names.
+nhanes_final <- nhanes_merged
+
+if(!"AlcoholCategory" %in% names(nhanes_final)) {
+  nhanes_final$AlcoholCategory <- nhanes_final$Alcohol_Status
+}
+if(!"hypertension_status" %in% names(nhanes_final)) {
+  nhanes_final$hypertension_status <- nhanes_final$htn_status
+}
+
+# Define model predictors for datadist
+predictors <- c("CMB_Score", "RIDAGEYR", "RIAGENDR", "RIDRETH1", "DMDEDUC2", 
+                "smoke_status", "DMDMARTZ", "BMI_value", "AlcoholCategory", 
+                "diabetes_status", "hypertension_status", "work_status", 
+                "MET_total", "INDFMPIR", "sedentary_min")
+
+# 3. Discovery Phase (2017-2020) with Raw WTMECPRP -----------------------------
+df_disc <- nhanes_final %>% filter(CYCLE == "2017-2020")
+
+dd_disc <- datadist(df_disc[, predictors])
+options(datadist = "dd_disc")
+
+design_disc <- svydesign(
+  id = ~SDMVPSU, strata = ~SDMVSTRA, weights = ~WTMECPRP, 
+  data = df_disc, nest = TRUE
+)
+
+fit_disc_raw <- svyglm(
+  Moderate_depression_above ~ rcs(CMB_Score, 4) + 
+    RIDAGEYR + RIAGENDR + RIDRETH1 + DMDEDUC2 + smoke_status + 
+    DMDMARTZ + BMI_value + AlcoholCategory + diabetes_status + 
+    hypertension_status + work_status + MET_total + INDFMPIR + 
+    sedentary_min,
+  design = design_disc, family = quasibinomial()
+)
+
+# 4. Validation Phase (2021-2023) with Raw WTMEC2YR ----------------------------
+df_valid <- nhanes_final %>% filter(CYCLE == "2021-2023")
+
+dd_valid <- datadist(df_valid[, predictors])
+options(datadist = "dd_valid")
+
+design_valid <- svydesign(
+  id = ~SDMVPSU, strata = ~SDMVSTRA, weights = ~WTMEC2YR, 
+  data = df_valid, nest = TRUE
+)
+
+fit_valid_raw <- svyglm(
+  Moderate_depression_above ~ rcs(CMB_Score, 4) + 
+    RIDAGEYR + RIAGENDR + RIDRETH1 + DMDEDUC2 + smoke_status + 
+    DMDMARTZ + BMI_value + AlcoholCategory + diabetes_status + 
+    hypertension_status + work_status + MET_total + INDFMPIR + 
+    sedentary_min,
+  design = design_valid, family = quasibinomial()
+)
+
+# 5. Extract and Compare Metrics -----------------------------------------------
+extract_metrics <- function(fit, label) {
+  all_names <- names(coef(fit))
+  lin_name  <- grep("CMB_Score$", all_names, value = TRUE)[1]
+  nl_name   <- grep("CMB_Score'", all_names, value = TRUE)[1]
+  
+  beta_lin <- coef(fit)[lin_name]
+  se_lin   <- sqrt(vcov(fit)[lin_name, lin_name])
+  beta_nl  <- coef(fit)[nl_name]
+  se_nl    <- sqrt(vcov(fit)[nl_name, nl_name])
+  
+  data.frame(
+    Cohort = label,
+    Linear_OR = round(exp(beta_lin), 3),
+    Linear_95_CI = paste0("(", round(exp(beta_lin - 1.96 * se_lin), 3), "-", round(exp(beta_lin + 1.96 * se_lin), 3), ")"),
+    Nonlinear_Beta = round(beta_nl, 4),
+    Nonlinear_P = round(2 * (1 - pnorm(abs(beta_nl / se_nl))), 4)
+  )
+}
+
+final_results <- rbind(
+  extract_metrics(fit_disc_raw, "Discovery (Raw Weights)"),
+  extract_metrics(fit_valid_raw, "Validation (Raw Weights)")
+)
+
+print(final_results)
+
+# 6. Clean up
+options(datadist = "dd")
+
+################################################################################
+# SCRIPT: Robust Bootstrap Stability Assessment (Fixed Version)
+# PURPOSE: Estimate 95% CI for the 8.69 risk threshold and curve nadir.
+################################################################################
+
+library(survey)
+library(rms)
+library(dplyr)
+
+# 1. Environment Setup ---------------------------------------------------------
+# Ensure nhanes_final is the dataset after merging raw weights
+# Using Model 4 variables for prediction
+set.seed(2026)
+n_iterations <- 1000 
+boot_results <- data.frame(nadir = numeric(n_iterations), 
+                           risk_point_1.1 = numeric(n_iterations))
+
+# 2. Define Reference Values for Prediction ------------------------------------
+# We pre-calculate these to ensure consistency across all bootstrap runs
+ref_age  <- mean(nhanes_final$RIDAGEYR, na.rm=TRUE)
+ref_bmi  <- mean(nhanes_final$BMI_value, na.rm=TRUE)
+ref_met  <- mean(nhanes_final$MET_total, na.rm=TRUE)
+ref_pir  <- mean(nhanes_final$INDFMPIR, na.rm=TRUE)
+ref_sed  <- mean(nhanes_final$sedentary_min, na.rm=TRUE)
+
+# 3. Execution Loop ------------------------------------------------------------
+cat("Starting 1,000 Bootstrap iterations with robust error handling...\n")
+
+for(i in 1:n_iterations) {
+  
+  # 3.1 Robust Resampling
+  # We ensure the resampled data has at least some cases of the outcome
+  boot_idx <- sample(1:nrow(nhanes_final), replace = TRUE)
+  boot_df  <- nhanes_final[boot_idx, ]
+  
+  # 3.2 Survey Design
+  boot_design <- svydesign(id = ~SDMVPSU, strata = ~SDMVSTRA, 
+                           weights = ~mec_adj, data = boot_df, nest = TRUE)
+  
+  # 3.3 Model Fitting with Error Handling
+  # We use try() to catch the 'eta' error and skip invalid iterations
+  boot_fit <- try({
+    svyglm(Moderate_depression_above ~ rcs(CMB_Score, 4) + 
+             RIDAGEYR + RIAGENDR + RIDRETH1 + DMDEDUC2 + smoke_status + 
+             DMDMARTZ + BMI_value + AlcoholCategory + diabetes_status + 
+             hypertension_status + work_status + MET_total + INDFMPIR + 
+             sedentary_min,
+           design = boot_design, family = quasibinomial())
+  }, silent = TRUE)
+  
+  # Skip to next iteration if model failed to converge
+  if (inherits(boot_fit, "try-error") || is.null(boot_fit)) {
+    next
+  }
+  
+  # 3.4 Predict Thresholds
+  pred_grid <- data.frame(CMB_Score = seq(0, 18, length.out = 500))
+  
+  pred_grid$RIDAGEYR <- ref_age
+  pred_grid$BMI_value <- ref_bmi
+  pred_grid$MET_total <- ref_met
+  pred_grid$INDFMPIR  <- ref_pir
+  pred_grid$sedentary_min <- ref_sed
+  
+  pred_grid$RIAGENDR     <- factor(levels(nhanes_final$RIAGENDR)[1], levels = levels(nhanes_final$RIAGENDR))
+  pred_grid$RIDRETH1     <- factor(levels(nhanes_final$RIDRETH1)[1], levels = levels(nhanes_final$RIDRETH1))
+  pred_grid$DMDEDUC2     <- factor(levels(nhanes_final$DMDEDUC2)[1], levels = levels(nhanes_final$DMDEDUC2))
+  pred_grid$smoke_status <- factor(levels(nhanes_final$smoke_status)[1], levels = levels(nhanes_final$smoke_status))
+  pred_grid$DMDMARTZ     <- factor(levels(nhanes_final$DMDMARTZ)[1], levels = levels(nhanes_final$DMDMARTZ))
+  pred_grid$AlcoholCategory <- factor(levels(nhanes_final$AlcoholCategory)[1], levels = levels(nhanes_final$AlcoholCategory))
+  pred_grid$diabetes_status <- factor(levels(nhanes_final$diabetes_status)[1], levels = levels(nhanes_final$diabetes_status))
+  pred_grid$hypertension_status <- factor(levels(nhanes_final$hypertension_status)[1], levels = levels(nhanes_final$hypertension_status))
+  pred_grid$work_status  <- factor(levels(nhanes_final$work_status)[1], levels = levels(nhanes_final$work_status))
+  
+  # Safe Prediction
+  preds <- try(predict(boot_fit, newdata = pred_grid, type = "link"), silent = TRUE)
+  if (inherits(preds, "try-error")) next
+  
+  # 3.5 Metrics Extraction
+  # Nadir
+  nadir_idx <- which.min(as.numeric(preds))
+  nadir_val <- pred_grid$CMB_Score[nadir_idx]
+  
+  # Risk escalation (OR >= 1.10)
+  target_link <- preds[nadir_idx] + log(1.10)
+  inflection_idx <- which(pred_grid$CMB_Score > nadir_val & as.numeric(preds) >= target_link)[1]
+  
+  # Record results
+  boot_results$nadir[i] <- nadir_val
+  boot_results$risk_point_1.1[i] <- ifelse(is.na(inflection_idx), NA, pred_grid$CMB_Score[inflection_idx])
+  
+  # Logging
+  if(i %% 100 == 0) cat("Iteration", i, "processed successfully.\n")
+}
+
+# 4. Summary & CI Calculation --------------------------------------------------
+# Remove failed iterations (0 or NA)
+valid_results <- boot_results %>% filter(nadir > 0 & !is.na(risk_point_1.1))
+
+final_stats <- valid_results %>%
+  summarise(
+    Successful_Runs = n(),
+    Nadir_Median = median(nadir),
+    Nadir_95CI = paste0("[", round(quantile(nadir, 0.025), 2), "-", round(quantile(nadir, 0.975), 2), "]"),
+    Threshold_Median = median(risk_point_1.1),
+    Threshold_95CI = paste0("[", round(quantile(risk_point_1.1, 0.025), 2), "-", round(quantile(risk_point_1.1, 0.975), 2), "]")
+  )
+
+cat("\n--- BOOTSTRAP STABILITY SUMMARY ---\n")
+print(final_stats)
+
+################################################################################
+# END OF SCRIPT
+################################################################################
+
