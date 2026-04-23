@@ -1,0 +1,665 @@
+################################################################################
+# STUDY: Sleep Onset Timing and Depression Association 
+# ANALYSIS: Weighted Restricted Cubic Spline (RCS) & Association Gradient Classification
+# DATA: NHANES 2017-2023 Consolidated Dataset
+################################################################################
+
+# 1. Load Essential Libraries --------------------------------------------------
+library(survey)
+library(rms)
+library(ggplot2)
+library(cowplot)
+library(gridExtra)
+library(dplyr)
+
+# Source custom weighted plotting function
+source("D:/code/svyggrcs1.8R.R")
+
+# 2. Data Acquisition & Pre-processing -----------------------------------------
+data_path <- "D:/code/12.Dataset.rds"
+nhanes_data <- readRDS(data_path)
+
+# Convert sleep midpoint from minutes to hours for interpretability
+nhanes_data$onset_wd_hours <- nhanes_data$SLQ300_min / 60
+nhanes_data$onset_we_hours <- nhanes_data$SLQ320_min / 60
+
+# Factorize categorical variables with academic labels
+nhanes_data$RIAGENDR <- factor(nhanes_data$RIAGENDR, levels = c(1, 2), labels = c("Male", "Female"))
+nhanes_data$RIDRETH1 <- factor(nhanes_data$RIDRETH1, 
+                               levels = c(1, 2, 3, 4, 5),
+                               labels = c("Mexican American", "Other Hispanic", 
+                                          "Non-Hispanic White", "Non-Hispanic Black", 
+                                          "Other Race"))
+nhanes_data$DMDEDUC2 <- factor(nhanes_data$DMDEDUC2, 
+                               levels = c(1, 2, 3, 4, 5),
+                               labels = c("< 9th Grade", "9-11th Grade", 
+                                          "High School Graduate", "Some College", 
+                                          "College Graduate"))
+nhanes_data$smoke_status <- factor(nhanes_data$smoke_status, levels = c(0, 1, 2), 
+                                   labels = c("Never Smoker", "Former Smoker", "Current Smoker"))
+nhanes_data$DMDMARTZ <- factor(nhanes_data$DMDMARTZ,
+                               levels = c(1, 2, 3),
+                               labels = c("Married", "Widowed/Divorced/Separated", "Never Married"))
+nhanes_data$AlcoholCategory <- factor(nhanes_data$Alcohol_Status,
+                                      levels = c(0, 1, 2),
+                                      labels = c("Never", "Light/Moderate", "Heavy"))
+nhanes_data$diabetes_status <- factor(nhanes_data$diabetes_status,
+                                      levels = c(0, 1),
+                                      labels = c("No", "Borderline/Yes"))
+nhanes_data$hypertension_status <- factor(nhanes_data$htn_status,
+                                          levels = c(0, 1),
+                                          labels = c("No", "Yes"))
+nhanes_data$work_status <- factor(nhanes_data$work_status,
+                                  levels = c(0, 1),
+                                  labels = c("Working", "Not Working"))
+
+# Configure data distribution for RMS package
+dd <- datadist(nhanes_data)
+options(datadist = "dd")
+
+# 3. Survey Design Specification -----------------------------------------------
+design <- svydesign(
+  id = ~SDMVPSU, 
+  strata = ~SDMVSTRA, 
+  weights = ~mec_adj, 
+  data = nhanes_data, 
+  nest = TRUE
+)
+
+# [New] Global Risk Threshold Configuration
+# ------------------------------------------------------------------------------
+VAL_REF      <- 1.05  # Relative deviation threshold from spline nadir (5% above minimum OR)
+VAL_MILD     <- 1.20  # Threshold for mild risk
+VAL_MODERATE <- 1.50  # Threshold for moderate risk
+
+# 4. Hierarchical Multivariable Modeling ---------------------------------------
+
+# Model 1: Unadjusted Association
+model_weekend_m1 <- svyglm(Moderate_depression_above ~ rcs(onset_we_hours, 4), design = design, family = quasibinomial())
+model_weekday_m1 <- svyglm(Moderate_depression_above ~ rcs(onset_wd_hours, 4), design = design, family = quasibinomial())
+
+# Model 2: Adjusted for Demographics (Age, Sex, Race)
+model_weekend_m2 <- svyglm(Moderate_depression_above ~ rcs(onset_we_hours, 4) + RIDAGEYR + RIAGENDR + RIDRETH1, design = design, family = quasibinomial())
+model_weekday_m2 <- svyglm(Moderate_depression_above ~ rcs(onset_wd_hours, 4) + RIDAGEYR + RIAGENDR + RIDRETH1, design = design, family = quasibinomial())
+
+# Model 3: Adjusted for Lifestyle, Comorbidities, and Socio-economics
+model_weekend_m3 <- svyglm(Moderate_depression_above ~ rcs(onset_we_hours, 4) + RIDAGEYR + RIAGENDR + RIDRETH1 + 
+                             DMDEDUC2 + smoke_status + DMDMARTZ + BMI_value + AlcoholCategory + diabetes_status + 
+                             hypertension_status + work_status + MET_total + INDFMPIR, design = design, family = quasibinomial())
+model_weekday_m3 <- svyglm(Moderate_depression_above ~ rcs(onset_wd_hours, 4) + RIDAGEYR + RIAGENDR + RIDRETH1 + 
+                             DMDEDUC2 + smoke_status + DMDMARTZ + BMI_value + AlcoholCategory + diabetes_status + 
+                             hypertension_status + work_status + MET_total + INDFMPIR, design = design, family = quasibinomial())
+
+# Model 4: Maximally Adjusted (Model 3 + Sedentary Behavior)
+model_weekend_m4 <- svyglm(Moderate_depression_above ~ rcs(onset_we_hours, 4) + RIDAGEYR + RIAGENDR + RIDRETH1 + 
+                             DMDEDUC2 + smoke_status + DMDMARTZ + BMI_value + AlcoholCategory + diabetes_status + 
+                             hypertension_status + work_status + MET_total + INDFMPIR + sedentary_min, design = design, family = quasibinomial())
+model_weekday_m4 <- svyglm(Moderate_depression_above ~ rcs(onset_wd_hours, 4) + RIDAGEYR + RIAGENDR + RIDRETH1 + 
+                             DMDEDUC2 + smoke_status + DMDMARTZ + BMI_value + AlcoholCategory + diabetes_status + 
+                             hypertension_status + work_status + MET_total + INDFMPIR + sedentary_min, design = design, family = quasibinomial())
+
+# ==============================================================================
+# 5. STATISTICAL DIAGNOSTICS & MODEL VALIDATION
+# ==============================================================================
+cat("\n=========== ACADEMIC MODEL DIAGNOSTICS ===========\n")
+
+
+# 5.1 Structural Multicollinearity (Standardized GLM VIF)
+# We include both exposures to ensure no mutual interference or high correlation.
+cat("\n--- Structural Multicollinearity (VIF) ---\n")
+
+vif_model <- glm(Moderate_depression_above ~ 
+                   onset_wd_hours + onset_we_hours + 
+                   RIDAGEYR + RIAGENDR + RIDRETH1 + DMDEDUC2 + smoke_status + 
+                   DMDMARTZ + BMI_value + AlcoholCategory + diabetes_status + 
+                   hypertension_status + work_status + MET_total + INDFMPIR + 
+                   sedentary_min, 
+                 data = nhanes_data, family = binomial())
+
+# Reporting GVIF^(1/(2*Df)) which should be < 2 (equivalent to VIF < 10 for continuous)
+print(car::vif(vif_model))
+
+
+# 5.2 Global Fit Information Criteria (Knot Selection)
+cat("\n--- Knot Selection Sensitivity (AIC) ---\n")
+# Based on Section 5.1 output, confirm if 4 knots minimize AIC compared to 3 or 5.
+# based on model stability, visual smoothness, and consistency with epidemiological spline practice (3–5 knots), rather than AIC minimization alone
+
+
+# 5.3 KNOT SENSITIVITY ANALYSIS (AIC COMPARISON)
+cat("\n--- Knot Sensitivity Analysis (AIC Comparison) ---\n")
+
+compare_knots <- function(outcome, var, design_obj) {
+  cat(sprintf("\n[Sensitivity Analysis for: %s]\n", var))
+  
+  results <- data.frame(Knots = 3:5, AIC = NA, P_NonLinear = NA)
+  
+  for (k in 3:5) {
+    # Fit model with k knots
+    form <- as.formula(paste0(outcome, " ~ rcs(", var, ", ", k, ") + 
+          RIDAGEYR + RIAGENDR + RIDRETH1 + DMDEDUC2 + smoke_status + DMDMARTZ + 
+          BMI_value + AlcoholCategory + diabetes_status + hypertension_status + 
+          work_status + MET_total + INDFMPIR + sedentary_min"))
+    fit <- svyglm(form, design = design_obj, family = quasibinomial())
+    
+    # Extract AIC and Nonlinear P-value (from anova)
+    results$AIC[results$Knots == k] <- AIC(fit)[1]
+    
+    # Capture the nonlinear P-value from the spline component
+    # Using anova to compare linear vs rcs for each knot configuration
+    lin_form <- as.formula(paste(outcome, "~", var, "+ RIDAGEYR + RIAGENDR + 
+              RIDRETH1 + DMDEDUC2 + smoke_status + DMDMARTZ + BMI_value + 
+              AlcoholCategory + diabetes_status + hypertension_status + work_status + 
+              MET_total + INDFMPIR + sedentary_min"))
+    lin_fit <- svyglm(lin_form, design = design_obj, family = quasibinomial())
+    results$P_NonLinear[results$Knots == k] <- anova(lin_fit, fit)$p
+  }
+  
+  print(results)
+  cat("Note: A lower AIC indicates a better balance of fit and complexity.\n")
+  return(results)
+}
+
+# Run comparison for both exposure variables
+res_knots_weekend <- compare_knots("Moderate_depression_above", "onset_we_hours", design)
+res_knots_weekday <- compare_knots("Moderate_depression_above", "onset_wd_hours", design)
+
+# 6. Visualization & Plot Data Extraction --------------------------------------
+
+# Generate spline plotting data
+rcs_weekend_m1 <- svyggrcs(model_weekend_m1)
+rcs_weekend_m2 <- svyggrcs(model_weekend_m2)
+rcs_weekend_m3 <- svyggrcs(model_weekend_m3)
+rcs_weekend_m4 <- svyggrcs(model_weekend_m4)
+
+rcs_weekday_m1 <- svyggrcs(model_weekday_m1)
+rcs_weekday_m2 <- svyggrcs(model_weekday_m2)
+rcs_weekday_m3 <- svyggrcs(model_weekday_m3)
+rcs_weekday_m4 <- svyggrcs(model_weekday_m4)
+
+# Data Validation Utility
+extract_and_validate_data <- function(rcs_object, time_type_name) {
+  data_df <- rcs_object[["newdat"]]
+  if (!is.data.frame(data_df)) data_df <- as.data.frame(data_df)
+  
+  numeric_cols <- c("yhat", "lower", "upper")
+  for (col in numeric_cols) {
+    if (col %in% names(data_df)) {
+      data_df[[col]] <- as.numeric(as.character(data_df[[col]]))
+    }
+  }
+  data_df$time_type <- time_type_name
+  return(data_df)
+}
+
+# Apply extraction
+data_weekend_m1 <- extract_and_validate_data(rcs_weekend_m1, "weekend")
+data_weekend_m2 <- extract_and_validate_data(rcs_weekend_m2, "weekend")
+data_weekend_m3 <- extract_and_validate_data(rcs_weekend_m3, "weekend")
+data_weekend_m4 <- extract_and_validate_data(rcs_weekend_m4, "weekend")
+
+data_weekday_m1 <- extract_and_validate_data(rcs_weekday_m1, "weekday")
+data_weekday_m2 <- extract_and_validate_data(rcs_weekday_m2, "weekday")
+data_weekday_m3 <- extract_and_validate_data(rcs_weekday_m3, "weekday")
+data_weekday_m4 <- extract_and_validate_data(rcs_weekday_m4, "weekday")
+
+# Column Standardization
+standardize_columns <- function(data_df, hour_col_name) {
+  names(data_df)[names(data_df) == hour_col_name] <- "hours"
+  data_df$hours <- as.numeric(as.character(data_df$hours))
+  return(data_df[, c("hours", "yhat", "lower", "upper", "time_type")])
+}
+
+data_weekend_m1 <- standardize_columns(data_weekend_m1, "onset_we_hours")
+data_weekend_m2 <- standardize_columns(data_weekend_m2, "onset_we_hours")
+data_weekend_m3 <- standardize_columns(data_weekend_m3, "onset_we_hours")
+data_weekend_m4 <- standardize_columns(data_weekend_m4, "onset_we_hours")
+
+data_weekday_m1 <- standardize_columns(data_weekday_m1, "onset_wd_hours")
+data_weekday_m2 <- standardize_columns(data_weekday_m2, "onset_wd_hours")
+data_weekday_m3 <- standardize_columns(data_weekday_m3, "onset_wd_hours")
+data_weekday_m4 <- standardize_columns(data_weekday_m4, "onset_wd_hours")
+
+# Data Cleaning Function
+clean_data <- function(data) {
+  numeric_columns <- c("hours", "yhat", "lower", "upper")
+  for (col in numeric_columns) data[[col]] <- as.numeric(as.character(data[[col]]))
+  return(data[complete.cases(data), ])
+}
+
+model1_data <- clean_data(rbind(data_weekend_m1, data_weekday_m1))
+model2_data <- clean_data(rbind(data_weekend_m2, data_weekday_m2))
+model3_data <- clean_data(rbind(data_weekend_m3, data_weekday_m3))
+model4_data <- clean_data(rbind(data_weekend_m4, data_weekday_m4))
+
+# Final Plotting logic with standardized Academic Colors
+color_scheme <- c("Weekend" = "darkorange", "Weekday" = "steelblue")
+
+create_safe_plot <- function(data, title) {
+  data$time_type <- factor(data$time_type, levels = c("weekend", "weekday"), labels = c("Weekend", "Weekday"))
+  
+  ggplot(data, aes(x = hours, y = yhat, group = time_type)) +
+    geom_ribbon(aes(ymin = lower, ymax = upper, fill = time_type), alpha = 0.2, colour = NA) +
+    geom_line(aes(color = time_type), size = 1) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "black", alpha = 0.6) +
+    scale_color_manual(values = color_scheme) +
+    scale_fill_manual(values = color_scheme) +
+    scale_x_continuous(breaks = seq(0, 24, by = 4), limits = c(0, 24)) +
+    labs(x = "Sleep Onset Time (Hours from Midnight)", y = "Odds Ratio (95% CI)", title = title,
+         color = "Timing Type", fill = "Timing Type") +
+    theme_bw() + theme(legend.position = "bottom", plot.title = element_text(face = "bold", hjust = 0.5))
+}
+
+plot_model1 <- create_safe_plot(model1_data, "Model 1: Crude Association")
+plot_model2 <- create_safe_plot(model2_data, "Model 2: Demographic Adjusted") 
+plot_model3 <- create_safe_plot(model3_data, "Model 3: Lifestyle Adjusted")
+plot_model4 <- create_safe_plot(model4_data, "Model 4: Fully Adjusted")
+
+combined_plot <- grid.arrange(plot_model1, plot_model2, plot_model3, plot_model4, ncol = 2)
+
+# 7. Inflection Point & Nadir Analysis -----------------------------------------
+
+calculate_inflection <- function(rcs_data, var_name, model_name) {
+  min_index <- which.min(as.numeric(rcs_data$yhat))
+  return(list(min_point = as.numeric(rcs_data$hours[min_index]), model = model_name))
+}
+
+cat("\n=== SUMMARY OF INFLECTION POINTS (NADIR) ===\n")
+# Example Weekend Nadir output
+cat("Weekend Nadir (Model 4):", round(calculate_inflection(data_weekend_m4, "weekend", "M4")$min_point, 2), "h\n")
+cat("Weekday Nadir (Model 4):", round(calculate_inflection(data_weekday_m4, "weekday", "M4")$min_point, 2), "h\n")
+
+# 8. Association Gradient Zonation & Lowest-Association Interval Analysis -----------------------------
+
+calculate_nadir_adjacent_interval <- function(rcs_data, data_name) {
+  min_or <- min(rcs_data$yhat, na.rm = TRUE)
+  threshold <- 1.05 * min_or
+  below_threshold <- which(rcs_data$yhat <= threshold)
+  best_int <- range(rcs_data$hours[below_threshold])
+  
+  cat(sprintf("\n--- %s Timing Interval with Minimal Estimated Association (Model 4) ---\n", data_name))
+  cat(sprintf("Nadir OR: %.4f | nadir_adjacent_interval: %.2f - %.2f h\n", min_or, best_int[1], best_int[2]))
+  
+  return(list(nadir_adjacent_interval = best_int, min_or = min_or))
+}
+
+# Execute for M4
+res_weekend <- calculate_nadir_adjacent_interval(data_weekend_m4, "Weekend")
+res_weekday <- calculate_nadir_adjacent_interval(data_weekday_m4, "Weekday")
+
+# 9. Sample Size Audit & Table 3 Generation ------------------------------------
+
+cat("\n>>> Finalizing Analytic Sample Size Audit <<<\n")
+
+
+# ==============================================================================
+# 10. REVISED: RELATIVE ASSOCIATION GRADIENT SCORING
+# ==============================================================================
+
+# Function to map exposure based on RELATIVE deviation from Nadir
+map_or_to_score <- function(hours_val, rcs_plot_data) {
+  # 1. Identify predicted OR
+  idx <- which.min(abs(rcs_plot_data$hours - hours_val))
+  predicted_or <- rcs_plot_data$yhat[idx]
+  nadir_or     <- min(rcs_plot_data$yhat)
+  
+  # 2. Scoring based on RELATIVE GRADIENT (Symmetry Protection)
+  # All thresholds are now multipliers of the specific model's nadir
+  score <- case_when(
+    predicted_or <= (VAL_REF * nadir_or)      ~ 0, # Nadir zone (0-5% deviation)
+    predicted_or <= (VAL_MILD * nadir_or)     ~ 1, # Mild gradient (5-20% deviation)
+    predicted_or <= (VAL_MODERATE * nadir_or) ~ 2, # Moderate gradient (20-50% deviation)
+    TRUE                                      ~ 3  # High gradient (>50% deviation)
+  )
+  return(score)
+}
+
+# --- FINAL SUMMARY FOR MANUSCRIPT ---
+cat("\n=== TABLE: RCS-DERIVED EXPOSURE INTERVALS BY ASSOCIATION SCORE ===\n")
+
+summarize_onset_intervals <- function(rcs_data, label) {
+  # 1. Identify Nadir
+  nadir_info <- rcs_data[which.min(rcs_data$yhat), ]
+  
+  cat(sprintf("\nTiming Type: %s\n", label))
+  cat(sprintf("Optimal Nadir: %.2f hours past midnight (Lowest OR: %.4f)\n", 
+              nadir_info$hours, nadir_info$yhat))
+  
+  # 2. Map every point in the spline to a score
+  rcs_data$score <- sapply(rcs_data$hours, map_or_to_score, rcs_plot_data = rcs_data)
+  
+  # 3. Aggregate intervals per score
+  summary_tab <- rcs_data %>%
+    group_by(score) %>%
+    summarise(
+      Start_Hour = min(hours),
+      End_Hour   = max(hours),
+      .groups = 'drop'
+    ) %>%
+    mutate(Clinical_Interpretation = c("Reference (Optimal)", "Mild Risk Elevation", 
+                                       "Moderate Risk Elevation", "High Risk Elevation")[score + 1])
+  
+  print(as.data.frame(summary_tab))
+}
+
+# Execute for both Weekend and Weekday
+summarize_onset_intervals(data_weekend_m4, "WEEKEND")
+summarize_onset_intervals(data_weekday_m4, "WEEKDAY")
+
+# Apply spline-based association classification to individual-level data 
+# Weekend and weekday timing are scored independently using their respective curves 
+nhanes_data <- nhanes_data %>%
+  rowwise() %>% 
+  mutate( 
+    weekend_score = map_or_to_score(onset_we_hours, data_weekend_m4), 
+    weekday_score = map_or_to_score(onset_wd_hours, data_weekday_m4), 
+    onset_total_score = weekend_score + weekday_score 
+    # Cumulative association deviation index 
+  ) %>% 
+  ungroup()
+# Final audit of association-level distribution 
+cat("\nSummary of Spline-Derived Association Level Distribution:\n") 
+print(table(nhanes_data$onset_total_score)) 
+# Save dataset with spline-derived association scores 
+saveRDS(nhanes_data, "D:/code/15.onset.rds")
+
+
+# ==============================================================================
+# Figure 2A. Restricted Cubic Spline Association between Sleep Onset Timing
+#            and Depressive Symptoms (Main manuscript figure)
+# ------------------------------------------------------------------------------
+# Main figure for manuscript:
+#   Figure 2A = Model 4 (Fully adjusted)
+#
+# Backup figures:
+#   Backup_Model1_Crude
+#   Backup_Model2_Demographic_Adjusted
+#   Backup_Model3_Lifestyle_Adjusted
+#
+# Output path:
+#   D:/code/photo
+#
+# Journal-style rules:
+#   - Pure English only
+#   - No caption inside figure
+#   - Colorblind-friendly palette
+#   - No legend in exported panels
+#   - TIFF 600 dpi for submission
+#   - PNG 300 dpi for proof/review
+#   - Clean, publication-ready formatting
+# ==============================================================================
+
+# install.packages(c("ggplot2", "cowplot", "dplyr", "grid"))
+
+library(ggplot2)
+library(cowplot)
+library(dplyr)
+library(grid)
+
+# ------------------------------------------------------------------------------
+# 0. Output directory
+# ------------------------------------------------------------------------------
+out_dir <- "D:/code/photo"
+if (!dir.exists(out_dir)) {
+  dir.create(out_dir, recursive = TRUE)
+}
+
+# ------------------------------------------------------------------------------
+# 1. Export settings
+# ------------------------------------------------------------------------------
+dpi_tiff <- 600
+dpi_png  <- 300
+
+main_fig_w <- 5.2
+main_fig_h <- 4.6
+
+backup_fig_w <- 5.2
+backup_fig_h <- 4.6
+
+# ------------------------------------------------------------------------------
+# 2. Typography and theme
+# ------------------------------------------------------------------------------
+base_size_main   <- 11
+base_size_backup <- 11
+
+journal_theme <- function(base_size = 11) {
+  theme_bw(base_size = base_size, base_family = "Arial") +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(colour = "black", linewidth = 0.7, fill = NA),
+      
+      axis.title = element_text(face = "bold", colour = "black", size = base_size),
+      axis.text  = element_text(colour = "black", size = base_size * 0.9),
+      axis.ticks = element_line(colour = "black", linewidth = 0.4),
+      axis.ticks.length = unit(2.5, "pt"),
+      
+      legend.position = "none",
+      legend.title = element_text(face = "bold", colour = "black", size = base_size * 0.9),
+      legend.text  = element_text(colour = "black", size = base_size * 0.85),
+      legend.key.width  = unit(1.4, "lines"),
+      legend.key.height = unit(0.8, "lines"),
+      legend.background = element_blank(),
+      legend.box.background = element_blank(),
+      
+      plot.title = element_blank(),
+      plot.margin = margin(8, 8, 6, 8)
+    )
+}
+
+# ------------------------------------------------------------------------------
+# 3. Colorblind-friendly palette
+# ------------------------------------------------------------------------------
+# Weekday and weekend are deliberately assigned distinct colors.
+# The legend is disabled, but color mapping is preserved for later panel assembly.
+col_weekday <- "#0072B2"   # blue
+col_weekend <- "#D55E00"   # orange
+alpha_ci    <- 0.16
+
+color_scheme <- c(
+  "Weekday" = col_weekday,
+  "Weekend" = col_weekend
+)
+
+# ------------------------------------------------------------------------------
+# 4. Panel builder
+# ------------------------------------------------------------------------------
+# Required columns in data:
+#   hours, yhat, lower, upper, time_type
+#
+# time_type values expected:
+#   "weekday" and "weekend"
+#
+# panel_label:
+#   e.g., "A" for Figure 2A
+# ------------------------------------------------------------------------------
+
+build_rcs_panel <- function(data, panel_label = "A", base_size = 11) {
+  
+  plot_data <- data %>%
+    mutate(
+      time_type = factor(
+        time_type,
+        levels = c("weekday", "weekend"),
+        labels = c("Weekday", "Weekend")
+      )
+    )
+  
+  # Determine y-axis range with modest padding
+  y_min <- min(plot_data$lower, na.rm = TRUE)
+  y_max <- max(plot_data$upper, na.rm = TRUE)
+  
+  y_min_round <- floor(y_min * 10) / 10
+  y_max_round <- ceiling(y_max * 10) / 10
+  
+  y_range <- y_max_round - y_min_round
+  if (y_range <= 0) y_range <- 0.5
+  
+  y_pad <- max(0.04, y_range * 0.06)
+  
+  p <- ggplot(plot_data, aes(x = hours, y = yhat, group = time_type)) +
+    geom_ribbon(
+      aes(ymin = lower, ymax = upper, fill = time_type),
+      alpha = alpha_ci,
+      colour = NA
+    ) +
+    geom_hline(
+      yintercept = 1,
+      linetype = "dashed",
+      colour = "grey35",
+      linewidth = 0.5
+    ) +
+    geom_line(
+      aes(colour = time_type),
+      linewidth = 0.95
+    ) +
+    scale_colour_manual(
+      values = color_scheme,
+      name = "Schedule",
+      guide = "none"
+    ) +
+    scale_fill_manual(
+      values = color_scheme,
+      name = "Schedule",
+      guide = "none"
+    ) +
+    scale_x_continuous(
+      name = "Sleep onset timing (hours past midnight)",
+      breaks = seq(0, 24, by = 4),
+      limits = c(0, 24),
+      expand = expansion(mult = c(0.01, 0.01))
+    ) +
+    scale_y_continuous(
+      name = "Modeled odds ratio (95% CI)",
+      limits = c(y_min_round - y_pad, y_max_round + y_pad),
+      expand = expansion(mult = c(0, 0))
+    ) +
+    annotate(
+      "text",
+      x = 0.5,
+      y = y_max_round + y_pad * 0.65,
+      label = panel_label,
+      hjust = 0,
+      vjust = 1,
+      family = "Arial",
+      fontface = "bold",
+      size = 5
+    ) +
+    journal_theme(base_size = base_size)
+  
+  return(p)
+}
+
+# ------------------------------------------------------------------------------
+# 5. Build figures
+# ------------------------------------------------------------------------------
+# These objects must already exist in the environment:
+#   model1_data, model2_data, model3_data, model4_data
+# ------------------------------------------------------------------------------
+
+fig_2A_main <- build_rcs_panel(
+  data = model4_data,
+  panel_label = "A",
+  base_size = base_size_main
+)
+
+backup_model1 <- build_rcs_panel(
+  data = model1_data,
+  panel_label = "A",
+  base_size = base_size_backup
+)
+
+backup_model2 <- build_rcs_panel(
+  data = model2_data,
+  panel_label = "A",
+  base_size = base_size_backup
+)
+
+backup_model3 <- build_rcs_panel(
+  data = model3_data,
+  panel_label = "A",
+  base_size = base_size_backup
+)
+
+# ------------------------------------------------------------------------------
+# 6. Export main manuscript figure (Model 4 = Figure 2A)
+# ------------------------------------------------------------------------------
+main_tiff <- file.path(out_dir, "Figure_2A_Model4_Fully_Adjusted.tiff")
+main_png  <- file.path(out_dir, "Figure_2A_Model4_Fully_Adjusted.png")
+
+ggsave(
+  filename = main_tiff,
+  plot = fig_2A_main,
+  device = "tiff",
+  dpi = dpi_tiff,
+  width = main_fig_w,
+  height = main_fig_h,
+  units = "in",
+  compression = "lzw",
+  bg = "white"
+)
+
+ggsave(
+  filename = main_png,
+  plot = fig_2A_main,
+  device = "png",
+  dpi = dpi_png,
+  width = main_fig_w,
+  height = main_fig_h,
+  units = "in",
+  bg = "white"
+)
+
+message(sprintf("[OK] Main manuscript figure exported: %s", main_tiff))
+message(sprintf("[OK] Main manuscript proof exported: %s", main_png))
+
+# ------------------------------------------------------------------------------
+# 7. Export backup figures
+# ------------------------------------------------------------------------------
+backup_list <- list(
+  Backup_Model1_Crude = backup_model1,
+  Backup_Model2_Demographic_Adjusted = backup_model2,
+  Backup_Model3_Lifestyle_Adjusted = backup_model3
+)
+
+for (nm in names(backup_list)) {
+  ggsave(
+    filename = file.path(out_dir, paste0(nm, ".tiff")),
+    plot = backup_list[[nm]],
+    device = "tiff",
+    dpi = dpi_tiff,
+    width = backup_fig_w,
+    height = backup_fig_h,
+    units = "in",
+    compression = "lzw",
+    bg = "white"
+  )
+  
+  ggsave(
+    filename = file.path(out_dir, paste0(nm, ".png")),
+    plot = backup_list[[nm]],
+    device = "png",
+    dpi = dpi_png,
+    width = backup_fig_w,
+    height = backup_fig_h,
+    units = "in",
+    bg = "white"
+  )
+  
+  message(sprintf("[OK] Backup figure exported: %s", nm))
+}
+
+message(sprintf("[DONE] All files saved to: %s", out_dir))
+
+# ==============================================================================
+# Suggested figure legend for manuscript
+# Do not place this text inside the figure.
+# ==============================================================================
+
+# Figure 2A. Association between sleep onset timing and depressive symptoms in
+# the fully adjusted model.
+# Modeled odds ratios (ORs) and 95% confidence intervals (CIs) are shown as a
+# function of sleep onset timing (hours past midnight) for weekday and weekend
+# schedules. The horizontal dashed line indicates OR = 1.
+#
+# Abbreviations: OR, odds ratio; CI, confidence interval.
