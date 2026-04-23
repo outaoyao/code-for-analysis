@@ -1,0 +1,147 @@
+# ==============================================================================
+# COMBINE SIX SENSITIVITY ANALYSIS FIGURES INTO A 2 x 3 PANEL
+# Output directory: D:/code/photo
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Load packages
+# ------------------------------------------------------------------------------
+library(ggplot2)
+library(cowplot)
+library(magick)
+library(grid)
+
+# ------------------------------------------------------------------------------
+# 2. Define input and output paths
+# ------------------------------------------------------------------------------
+out_dir <- "D:/code/photo"
+
+file_A <- file.path(out_dir, "Sensitivity_Analysis_A_RCS.tiff")
+file_B <- file.path(out_dir, "Sensitivity_Analysis_B_RCS.tiff")
+file_C <- file.path(out_dir, "Sensitivity_Analysis_C_RCS.tiff")
+file_D <- file.path(out_dir, "Sensitivity_Analysis_D_RCS.tiff")
+file_E <- file.path(out_dir, "Supplementary_Figure_E_RCS_FullyAdjusted_PHQ8ge9.tiff")
+file_F <- file.path(out_dir, "Supplementary_Figure_F_RCS_FullyAdjusted_PHQ8ge10.tiff")
+
+out_tiff <- file.path(out_dir, "Combined_Sensitivity_Analyses_2x3.tiff")
+out_png  <- file.path(out_dir, "Combined_Sensitivity_Analyses_2x3.png")
+out_pdf  <- file.path(out_dir, "Combined_Sensitivity_Analyses_2x3.pdf")
+
+# ------------------------------------------------------------------------------
+# 3. Check whether files exist
+# ------------------------------------------------------------------------------
+input_files <- c(file_A, file_B, file_C, file_D, file_E, file_F)
+
+missing_files <- input_files[!file.exists(input_files)]
+
+if (length(missing_files) > 0) {
+  stop(
+    paste(
+      "The following required files are missing:",
+      paste(missing_files, collapse = "\n")
+    )
+  )
+}
+
+# ------------------------------------------------------------------------------
+# 4. Read images
+# ------------------------------------------------------------------------------
+img_A <- image_read(file_A)
+img_B <- image_read(file_B)
+img_C <- image_read(file_C)
+img_D <- image_read(file_D)
+img_E <- image_read(file_E)
+img_F <- image_read(file_F)
+
+# ------------------------------------------------------------------------------
+# 5. Standardize image size
+# ------------------------------------------------------------------------------
+target_geometry <- "2400x1920"
+
+img_list <- list(img_A, img_B, img_C, img_D, img_E, img_F)
+
+img_list <- lapply(img_list, function(x) {
+  image_resize(x, target_geometry)
+})
+
+# ------------------------------------------------------------------------------
+# 6. Convert to grob
+# ------------------------------------------------------------------------------
+grob_list <- lapply(img_list, function(x) {
+  rasterGrob(as.raster(x), interpolate = FALSE)
+})
+
+# ------------------------------------------------------------------------------
+# 7. Wrap into ggplot objects
+# ------------------------------------------------------------------------------
+plot_list <- lapply(grob_list, function(g) {
+  ggdraw() + draw_grob(g)
+})
+
+# ------------------------------------------------------------------------------
+# 8. Combine into 2 x 3 layout
+# ------------------------------------------------------------------------------
+panel_plot <- plot_grid(
+  plotlist = plot_list,
+  ncol = 3,
+  nrow = 2,
+  align = "hv",
+  axis = "tblr"
+)
+
+# ------------------------------------------------------------------------------
+# 9. Final plot (no title for journal submission)
+# ------------------------------------------------------------------------------
+final_combined_plot <- panel_plot
+
+# ------------------------------------------------------------------------------
+# 10. Export TIFF (publication quality)
+# ------------------------------------------------------------------------------
+ggsave(
+  filename = out_tiff,
+  plot = final_combined_plot,
+  device = "tiff",
+  dpi = 600,
+  width = 15,  
+  height = 10,
+  units = "in",
+  compression = "lzw",
+  bg = "white"
+)
+
+# ------------------------------------------------------------------------------
+# 11. Export PNG
+# ------------------------------------------------------------------------------
+ggsave(
+  filename = out_png,
+  plot = final_combined_plot,
+  device = "png",
+  dpi = 300,
+  width = 15,
+  height = 10,
+  units = "in",
+  bg = "white"
+)
+
+# ------------------------------------------------------------------------------
+# 12. Export PDF (vector)
+# ------------------------------------------------------------------------------
+ggsave(
+  filename = out_pdf,
+  plot = final_combined_plot,
+  device = cairo_pdf,
+  width = 15,
+  height = 10,
+  units = "in",
+  bg = "white"
+)
+
+# ------------------------------------------------------------------------------
+# 13. Preview
+# ------------------------------------------------------------------------------
+print(final_combined_plot)
+
+message(sprintf("[OK] Combined TIFF exported: %s", out_tiff))
+message(sprintf("[OK] Combined PNG exported: %s", out_png))
+message(sprintf("[OK] Combined PDF exported: %s", out_pdf))
+message("[DONE] Six-panel (2x3) sensitivity analysis figure created successfully.")
