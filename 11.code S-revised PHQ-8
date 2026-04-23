@@ -1,0 +1,105 @@
+################################################################################
+# Script: Master Data Integration (Updated for PHQ-8 Sensitivity Analysis)
+# Purpose: Standardize SEQN types and merge 10 RDS datasets, including the
+#          updated PHQ-8 sensitivity-analysis dataset.
+# Status: Publication Quality
+################################################################################
+
+library(tidyverse)
+
+base_path <- "D:/code"
+setwd(base_path)
+
+cat("Step 1: Loading datasets and standardizing SEQN to numeric...\n")
+
+# Helper function to load and standardize SEQN type
+load_and_fix <- function(file_name) {
+  readRDS(file_name) %>%
+    mutate(SEQN = as.numeric(as.character(SEQN)))
+}
+
+# --- Dataset Loading with Standardized Selection ---
+
+df1 <- load_and_fix("1.data.rds") %>%
+  select(-WTINTPRP, -WTMECPRP, -WTINT2YR, -WTMEC2YR, -SDDSRVYR, -RIDSTATR)
+
+# Updated depression dataset: use 2.data_phq8.rds instead of 2.data.rds
+df2 <- load_and_fix("2.data_phq8.rds") %>%
+  select(
+    SEQN,
+    PHQ9_SCORE,
+    PHQ8_SCORE,
+    PHQ8_depression_above_10,
+    PHQ8_depression_above_9,
+    PHQ9_depression_above_10,
+    PHQ9_modsevere_above_15,
+    CYCLE
+  )
+
+df3 <- load_and_fix("3.data.rds") %>%
+  select(
+    SEQN, dur_wd, dur_we, SLQ300_min, SLQ310_min, SLQ320_min,
+    SLQ330_min, midpoint_wd, midpoint_we, SJL_raw, SJL_abs,
+    WCS_raw, WCS_abs, dur_wd_cat, dur_we_cat,
+    dur_wd_cat_num, dur_we_cat_num
+  )
+
+df4 <- load_and_fix("4.data.rds") %>%
+  select(SEQN, smoke_status)
+
+df5 <- load_and_fix("5.data.rds") %>%
+  select(
+    SEQN, BMI_value, BMI_cat, BMI_cat_ordinal,
+    BMI_detailed, BMI_detailed_ordinal
+  )
+
+df6 <- load_and_fix("6.data.rds") %>%
+  select(SEQN, Alcohol_Status, Alcohol_Label)
+
+df7 <- load_and_fix("7.data.rds") %>%
+  select(SEQN, diabetes_status)
+
+df8 <- load_and_fix("8.data.rds") %>%
+  select(SEQN, htn_status)
+
+df9 <- load_and_fix("9.data.rds") %>%
+  select(SEQN, work_status)
+
+df10 <- load_and_fix("10.data.rds") %>%
+  select(
+    SEQN, MET_total, PAD680, MET_cat_label, MET_cat_num,
+    sedentary_min, sedentary_cat_label, sedentary_cat_num
+  )
+
+# --- Sequential Merging ---
+
+cat("Step 2: Merging datasets...\n")
+
+data_list <- list(df1, df2, df3, df4, df5, df6, df7, df8, df9, df10)
+
+final_dataset <- data_list %>%
+  reduce(left_join, by = "SEQN")
+
+# --- Final Checks -------------------------------------------------------------
+
+cat("\nFinal Dimensions:", dim(final_dataset)[1], "rows and", dim(final_dataset)[2], "variables.\n")
+cat("Summary of SEQN type:", class(final_dataset$SEQN), "\n")
+
+cat("\nChecking key depression variables...\n")
+print(summary(final_dataset$PHQ9_SCORE))
+print(summary(final_dataset$PHQ8_SCORE))
+
+cat("\nDistribution of PHQ-8 >= 10:\n")
+print(table(final_dataset$PHQ8_depression_above_10, useNA = "always"))
+
+cat("\nDistribution of PHQ-8 >= 9:\n")
+print(table(final_dataset$PHQ8_depression_above_9, useNA = "always"))
+
+cat("\nDistribution of PHQ-9 >= 10:\n")
+print(table(final_dataset$PHQ9_depression_above_10, useNA = "always"))
+
+# --- Export ------------------------------------------------------------------
+
+saveRDS(final_dataset, "11.Dataset_S_revised_PHQ-8.rds")
+
+cat("\nProcess complete. Dataset saved to: 11.Dataset_S_revised_PHQ-8.rds\n")
